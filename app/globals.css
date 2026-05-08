@@ -1,0 +1,51 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root,
+[data-theme='dark'] {
+  color-scheme: dark;
+  --bg: 10 10 10;
+  --fg: 255 255 255;
+  --muted: 102 102 102;
+  --border: 26 26 26;
+  --card: 12 12 12;
+  --card-hover: 16 16 16;
+  --card-subtle: 15 15 15;
+  --drop-active: 16 23 37;
+}
+
+[data-theme='light'] {
+  color-scheme: light;
+  --bg: 250 250 250;
+  --fg: 17 17 17;
+  --muted: 102 102 102;
+  --border: 224 224 224;
+  --card: 255 255 255;
+  --card-hover: 245 245 245;
+  --card-subtle: 248 248 248;
+  --drop-active: 235 242 255;
+}
+
+html,
+body {
+  background: rgb(var(--bg));
+  color: rgb(var(--fg));
+  min-height: 100vh;
+}
+
+* {
+  border-color: rgb(var(--border));
+}
+
+::selection {
+  background: rgba(59, 130, 246, 0.4);
+}
+
+input,
+button,
+textarea {
+  transition-property: background-color, border-color, color, opacity;
+  transition-duration: 180ms;
+  transition-timing-function: ease-out;
+}
