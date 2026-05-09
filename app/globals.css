@@ -3,49 +3,105 @@
 @tailwind utilities;
 
 :root,
-[data-theme='dark'] {
-  color-scheme: dark;
-  --bg: 10 10 10;
-  --fg: 255 255 255;
-  --muted: 102 102 102;
-  --border: 26 26 26;
-  --card: 12 12 12;
-  --card-hover: 16 16 16;
-  --card-subtle: 15 15 15;
-  --drop-active: 16 23 37;
-}
-
 [data-theme='light'] {
   color-scheme: light;
-  --bg: 250 250 250;
-  --fg: 17 17 17;
-  --muted: 102 102 102;
-  --border: 224 224 224;
+  --background: 255 255 255;
+  --foreground: 10 10 10;
   --card: 255 255 255;
-  --card-hover: 245 245 245;
-  --card-subtle: 248 248 248;
-  --drop-active: 235 242 255;
+  --card-foreground: 10 10 10;
+  --popover: 255 255 255;
+  --popover-foreground: 10 10 10;
+  --primary: 10 10 10;
+  --primary-foreground: 255 255 255;
+  --secondary: 245 245 245;
+  --secondary-foreground: 10 10 10;
+  --muted: 245 245 245;
+  --muted-foreground: 115 115 115;
+  --accent: 10 10 10;
+  --accent-foreground: 255 255 255;
+  --border: 229 229 229;
+  --input: 245 245 245;
+  --ring: 10 10 10;
+  --destructive: 220 38 38;
+  --severity-critical: 239 68 68;
+  --severity-major: 245 158 11;
+  --severity-minor: 59 130 246;
+}
+
+[data-theme='dark'] {
+  color-scheme: dark;
+  --background: 10 10 10;
+  --foreground: 250 250 250;
+  --card: 10 10 10;
+  --card-foreground: 250 250 250;
+  --popover: 10 10 10;
+  --popover-foreground: 250 250 250;
+  --primary: 250 250 250;
+  --primary-foreground: 10 10 10;
+  --secondary: 23 23 23;
+  --secondary-foreground: 250 250 250;
+  --muted: 38 38 38;
+  --muted-foreground: 163 163 163;
+  --accent: 250 250 250;
+  --accent-foreground: 10 10 10;
+  --border: 38 38 38;
+  --input: 23 23 23;
+  --ring: 250 250 250;
+  --destructive: 220 38 38;
+  --severity-critical: 239 68 68;
+  --severity-major: 245 158 11;
+  --severity-minor: 59 130 246;
 }
 
 html,
 body {
-  background: rgb(var(--bg));
-  color: rgb(var(--fg));
+  background: rgb(var(--background));
+  color: rgb(var(--foreground));
   min-height: 100vh;
 }
 
-* {
-  border-color: rgb(var(--border));
-}
-
 ::selection {
-  background: rgba(59, 130, 246, 0.4);
+  background: rgba(10, 10, 10, 0.15);
 }
 
 input,
 button,
-textarea {
-  transition-property: background-color, border-color, color, opacity;
+textarea,
+select {
+  transition-property: background-color, border-color, color, opacity, box-shadow;
   transition-duration: 180ms;
   transition-timing-function: ease-out;
+}
+
+@layer utilities {
+  .shadow-elevated {
+    box-shadow:
+      rgba(14, 63, 126, 0.04) 0px 0px 0px 1px,
+      rgba(42, 51, 69, 0.04) 0px 1px 1px -0.5px,
+      rgba(42, 51, 70, 0.04) 0px 3px 3px -1.5px,
+      rgba(42, 51, 70, 0.04) 0px 6px 6px -3px,
+      rgba(14, 63, 126, 0.04) 0px 12px 12px -6px,
+      rgba(14, 63, 126, 0.04) 0px 24px 24px -12px;
+  }
+}
+
+@keyframes reveal-up {
+  from {
+    transform: translateY(24px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+.animate-reveal-up {
+  animation: reveal-up 0.6s ease-out both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-reveal-up {
+    animation: none;
+  }
 }

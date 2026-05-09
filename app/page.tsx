@@ -30,14 +30,10 @@ function detectFileType(filename: string): FileType {
   return 'image';
 }
 
-function severityBorder(severity: Violation['severity']): string {
+function severityColor(severity: Violation['severity']): string {
   if (severity === 'critical') return '#EF4444';
   if (severity === 'major') return '#F59E0B';
   return '#3B82F6';
-}
-
-function severityLabel(severity: Violation['severity']): string {
-  return severity.toUpperCase();
 }
 
 const INITIAL_STEPS: PipelineStep[] = [
@@ -48,12 +44,12 @@ const INITIAL_STEPS: PipelineStep[] = [
 ];
 
 export default function PlanqPage() {
-  const [theme, setTheme] = useState<Theme>('dark');
+  const [theme, setTheme] = useState<Theme>('light');
   useEffect(() => {
     const stored = (typeof window !== 'undefined'
       ? (localStorage.getItem('planq-theme') as Theme | null)
-      : null) ?? 'dark';
-    setTheme(stored === 'light' ? 'light' : 'dark');
+      : null) ?? 'light';
+    setTheme(stored === 'dark' ? 'dark' : 'light');
   }, []);
   const toggleTheme = useCallback(() => {
     setTheme((prev) => {
@@ -160,295 +156,411 @@ export default function PlanqPage() {
     });
   }, [result, severityFilter, typeFilter]);
 
-  return (
-    <main className="min-h-screen bg-bg text-fg">
-      <header className="border-b border-border">
-        <div className="mx-auto flex max-w-5xl items-baseline justify-between px-6 py-5">
-          <div className="flex items-baseline gap-3">
-            <span className="font-sans text-2xl font-bold tracking-tight">planq</span>
-            <span className="font-mono text-xs text-muted">by staqtech</span>
-          </div>
-          <div className="flex items-center gap-4">
-            <span className="hidden font-mono text-[11px] uppercase tracking-widest text-muted sm:inline">
-              building code violation checker
-            </span>
-            <button
-              onClick={toggleTheme}
-              aria-label={`switch to ${theme === 'dark' ? 'light' : 'dark'} mode`}
-              className="border border-border px-3 py-1.5 font-mono text-[10px] uppercase tracking-widest text-muted transition-colors hover:text-fg"
-            >
-              {theme === 'dark' ? 'light' : 'dark'} mode
-            </button>
-          </div>
-        </div>
-      </header>
+  const canAnalyze = !analyzing && files.length > 0;
 
-      <section className="mx-auto max-w-5xl px-6 py-10">
-        <div className="space-y-6">
-          <div>
-            <label className="mb-2 block font-mono text-[11px] uppercase tracking-widest text-muted">
-              Project name
-            </label>
+  return (
+    <main className="min-h-screen bg-background text-foreground">
+      <Header theme={theme} onToggleTheme={toggleTheme} />
+
+      <section className="px-6 pt-32 pb-16 md:px-12 md:pt-40 md:pb-24 lg:px-20 lg:pt-48 lg:pb-28">
+        <div className="mx-auto max-w-3xl">
+          <Eyebrow>Beta access · Building code review</Eyebrow>
+          <h1 className="mt-4 text-4xl font-medium tracking-tight md:text-5xl lg:text-6xl">
+            Catch the issues before the city does.
+          </h1>
+          <p className="mt-6 max-w-2xl text-base leading-relaxed text-muted-foreground md:text-lg">
+            Drop architectural plans. planq cross-checks every dimension, door, corridor and
+            stair against the building code, then flags compliance and consistency issues
+            with citations.
+          </p>
+        </div>
+      </section>
+
+      <section className="px-6 pb-20 md:px-12 md:pb-28 lg:px-20 lg:pb-32">
+        <div className="mx-auto max-w-3xl space-y-10">
+          <Field label="Project name">
             <input
               type="text"
               value={projectName}
               onChange={(e) => setProjectName(e.target.value)}
-              placeholder="e.g. 240 Pine Street — 4-storey mixed-use"
-              className="w-full border border-border bg-card px-4 py-3 text-fg placeholder:text-muted focus:border-accent focus:outline-none"
+              placeholder="240 Pine Street — 4-storey mixed-use"
+              className="w-full rounded-full border border-border bg-input px-5 py-3 text-base text-foreground placeholder:text-muted-foreground focus:border-foreground focus:outline-none"
             />
-          </div>
+          </Field>
 
-          <div
-            onDragEnter={(e) => {
-              e.preventDefault();
-              setDragActive(true);
-            }}
-            onDragOver={(e) => {
-              e.preventDefault();
-              setDragActive(true);
-            }}
-            onDragLeave={() => setDragActive(false)}
-            onDrop={onDrop}
-            onClick={() => inputRef.current?.click()}
-            className={`cursor-pointer border border-dashed px-6 py-12 text-center transition-colors ${
-              dragActive ? 'border-accent bg-dropActive' : 'border-border bg-cardSubtle'
-            }`}
-          >
-            <p className="font-sans text-base">Drag plans here, or click to browse</p>
-            <p className="mt-1 font-mono text-[11px] uppercase tracking-widest text-muted">
-              .pdf · .png · .jpg · .tiff · .dxf · .dwg
-            </p>
-            <input
-              ref={inputRef}
-              type="file"
-              multiple
-              accept={ACCEPT_ATTR}
-              hidden
-              onChange={(e) => {
-                if (e.target.files) ingestFiles(e.target.files);
-                e.target.value = '';
+          <Field label="Plan files">
+            <div
+              onDragEnter={(e) => {
+                e.preventDefault();
+                setDragActive(true);
               }}
-            />
-          </div>
-
-          {files.length > 0 && (
-            <ul className="border border-border">
-              {files.map((pf, i) => (
-                <li
-                  key={`${pf.file.name}-${i}`}
-                  className="flex items-center justify-between border-b border-border px-4 py-3 last:border-b-0"
-                >
-                  <div className="flex items-center gap-3">
-                    <span className="font-mono text-[10px] uppercase tracking-widest text-accent">
-                      {pf.fileType}
-                    </span>
-                    <span className="font-sans text-sm">{pf.file.name}</span>
-                    <span className="font-mono text-[10px] text-muted">
-                      {(pf.file.size / 1024).toFixed(1)} KB
-                    </span>
-                  </div>
-                  <button
-                    onClick={() => removeFile(i)}
-                    className="font-mono text-[11px] uppercase tracking-widest text-muted hover:text-fg"
-                  >
-                    remove
-                  </button>
-                </li>
-              ))}
-            </ul>
-          )}
-
-          <div className="flex items-center justify-between">
-            <button
-              onClick={runAnalyze}
-              disabled={analyzing || files.length === 0}
-              className="bg-accent px-6 py-3 font-sans text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-40"
+              onDragOver={(e) => {
+                e.preventDefault();
+                setDragActive(true);
+              }}
+              onDragLeave={() => setDragActive(false)}
+              onDrop={onDrop}
+              onClick={() => inputRef.current?.click()}
+              className={`cursor-pointer rounded-2xl border border-dashed px-6 py-16 text-center transition-colors ${
+                dragActive
+                  ? 'border-foreground bg-secondary/60'
+                  : 'border-border bg-secondary/30 hover:bg-secondary/60'
+              }`}
             >
-              {analyzing ? 'Analyzing…' : 'Analyze Plans'}
-            </button>
-            {error && <span className="font-mono text-[11px] text-critical">{error}</span>}
+              <p className="text-base font-medium md:text-lg">
+                Drag plans here, or click to browse.
+              </p>
+              <p className="mt-3 font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+                PDF · PNG · JPG · TIFF · DXF · DWG
+              </p>
+              <input
+                ref={inputRef}
+                type="file"
+                multiple
+                accept={ACCEPT_ATTR}
+                hidden
+                onChange={(e) => {
+                  if (e.target.files) ingestFiles(e.target.files);
+                  e.target.value = '';
+                }}
+              />
+            </div>
+
+            {files.length > 0 && (
+              <ul className="mt-4 overflow-hidden rounded-2xl border border-border">
+                {files.map((pf, i) => (
+                  <li
+                    key={`${pf.file.name}-${i}`}
+                    className="flex items-center justify-between gap-4 border-b border-border bg-card px-5 py-4 last:border-b-0"
+                  >
+                    <div className="flex min-w-0 items-center gap-3">
+                      <span className="rounded-full border border-border px-2 py-[2px] font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+                        {pf.fileType}
+                      </span>
+                      <span className="truncate text-sm">{pf.file.name}</span>
+                      <span className="font-mono text-[10px] text-muted-foreground">
+                        {(pf.file.size / 1024).toFixed(1)} KB
+                      </span>
+                    </div>
+                    <button
+                      onClick={() => removeFile(i)}
+                      className="text-sm text-muted-foreground transition-colors hover:text-foreground"
+                    >
+                      remove
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </Field>
+
+          <div className="flex flex-wrap items-center justify-between gap-4 border-t border-border pt-8">
+            <div className="flex items-center gap-4">
+              <button
+                onClick={runAnalyze}
+                disabled={!canAnalyze}
+                className="rounded-full bg-foreground px-6 py-3 text-sm font-medium text-background transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                {analyzing ? 'Analyzing…' : 'Analyze plans'}
+              </button>
+              <span className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+                {files.length} file{files.length === 1 ? '' : 's'} queued
+              </span>
+            </div>
+            {error && (
+              <span className="font-mono text-xs" style={{ color: '#EF4444' }}>
+                {error}
+              </span>
+            )}
           </div>
 
           {(analyzing || steps.some((s) => s.status !== 'pending')) && (
-            <ol className="border border-border">
-              {steps.map((step, i) => (
-                <li
-                  key={step.label}
-                  className="flex items-center justify-between border-b border-border px-4 py-3 last:border-b-0"
-                >
-                  <div className="flex items-center gap-3">
-                    <span className="font-mono text-[11px] uppercase tracking-widest text-muted">
-                      {String(i + 1).padStart(2, '0')}
-                    </span>
-                    <span className="font-sans text-sm">{step.label}</span>
-                  </div>
-                  <span
-                    className={`font-mono text-[11px] uppercase tracking-widest ${
-                      step.status === 'done'
-                        ? 'text-accent'
-                        : step.status === 'active'
-                          ? 'text-fg'
-                          : 'text-muted'
-                    }`}
-                  >
-                    {step.status === 'done'
-                      ? 'done'
-                      : step.status === 'active'
-                        ? 'running'
-                        : 'pending'}
-                  </span>
-                </li>
-              ))}
-            </ol>
+            <PipelineTable steps={steps} />
           )}
         </div>
+      </section>
 
-        {result && (
-          <div className="mt-12 space-y-6">
-            <div className="flex flex-wrap items-center justify-between gap-4 border border-border px-5 py-4">
-              <div className="flex items-baseline gap-6">
-                <div>
-                  <p className="font-mono text-[10px] uppercase tracking-widest text-muted">
-                    total violations
-                  </p>
-                  <p className="font-sans text-3xl font-bold">
-                    {result.violations.length}
-                  </p>
-                </div>
-                <SummaryStat label="critical" value={result.summary.critical} color="#EF4444" />
-                <SummaryStat label="major" value={result.summary.major} color="#F59E0B" />
-                <SummaryStat label="minor" value={result.summary.minor} color="#3B82F6" />
-                <SummaryStat label="compliance" value={result.summary.compliance} />
-                <SummaryStat label="consistency" value={result.summary.consistency} />
-              </div>
-              <p className="font-mono text-[11px] uppercase tracking-widest text-muted">
-                sheets analyzed: {result.sheets_analyzed}
-              </p>
+      {result && (
+        <section className="border-t border-border px-6 py-20 md:px-12 md:py-28 lg:px-20 lg:py-32">
+          <div className="mx-auto max-w-5xl space-y-12">
+            <div>
+              <Eyebrow>Verdict</Eyebrow>
+              <h2 className="mt-3 text-3xl font-medium tracking-tight md:text-4xl lg:text-5xl">
+                {result.violations.length === 0
+                  ? 'No violations found.'
+                  : `${result.violations.length} violation${
+                      result.violations.length === 1 ? '' : 's'
+                    } across ${result.sheets_analyzed} sheet${
+                      result.sheets_analyzed === 1 ? '' : 's'
+                    }.`}
+              </h2>
             </div>
+
+            <StatStrip
+              items={[
+                { label: 'Total', value: result.violations.length },
+                {
+                  label: 'Critical',
+                  value: result.summary.critical,
+                  color: '#EF4444',
+                },
+                {
+                  label: 'Major',
+                  value: result.summary.major,
+                  color: '#F59E0B',
+                },
+                {
+                  label: 'Minor',
+                  value: result.summary.minor,
+                  color: '#3B82F6',
+                },
+                { label: 'Compliance', value: result.summary.compliance },
+                { label: 'Consistency', value: result.summary.consistency },
+              ]}
+            />
 
             {result.sheets && result.sheets.length > 0 && (
               <ExtractedSheetsPanel sheets={result.sheets} />
             )}
 
-            <div className="flex flex-wrap gap-2">
-              <FilterButton
-                active={severityFilter === 'all' && typeFilter === 'all'}
-                onClick={() => {
-                  setSeverityFilter('all');
-                  setTypeFilter('all');
-                }}
-              >
-                All
-              </FilterButton>
-              <FilterButton
-                active={severityFilter === 'critical'}
-                onClick={() => setSeverityFilter('critical')}
-              >
-                Critical
-              </FilterButton>
-              <FilterButton
-                active={severityFilter === 'major'}
-                onClick={() => setSeverityFilter('major')}
-              >
-                Major
-              </FilterButton>
-              <FilterButton
-                active={severityFilter === 'minor'}
-                onClick={() => setSeverityFilter('minor')}
-              >
-                Minor
-              </FilterButton>
-              <FilterButton
-                active={typeFilter === 'compliance'}
-                onClick={() => setTypeFilter('compliance')}
-              >
-                Compliance
-              </FilterButton>
-              <FilterButton
-                active={typeFilter === 'consistency'}
-                onClick={() => setTypeFilter('consistency')}
-              >
-                Consistency
-              </FilterButton>
+            <div>
+              <Eyebrow>Violations</Eyebrow>
+              <div className="mt-4 flex flex-wrap gap-2">
+                <FilterButton
+                  active={severityFilter === 'all' && typeFilter === 'all'}
+                  onClick={() => {
+                    setSeverityFilter('all');
+                    setTypeFilter('all');
+                  }}
+                >
+                  All
+                </FilterButton>
+                <FilterButton
+                  active={severityFilter === 'critical'}
+                  onClick={() => setSeverityFilter('critical')}
+                >
+                  Critical
+                </FilterButton>
+                <FilterButton
+                  active={severityFilter === 'major'}
+                  onClick={() => setSeverityFilter('major')}
+                >
+                  Major
+                </FilterButton>
+                <FilterButton
+                  active={severityFilter === 'minor'}
+                  onClick={() => setSeverityFilter('minor')}
+                >
+                  Minor
+                </FilterButton>
+                <FilterButton
+                  active={typeFilter === 'compliance'}
+                  onClick={() => setTypeFilter('compliance')}
+                >
+                  Compliance
+                </FilterButton>
+                <FilterButton
+                  active={typeFilter === 'consistency'}
+                  onClick={() => setTypeFilter('consistency')}
+                >
+                  Consistency
+                </FilterButton>
+              </div>
             </div>
 
             {filteredViolations.length === 0 ? (
-              <div className="border border-border px-6 py-12 text-center">
-                <p className="font-sans text-2xl text-emerald-400">✓</p>
-                <p className="mt-2 font-sans text-base">No violations found</p>
-                <p className="mt-1 font-mono text-[11px] uppercase tracking-widest text-muted">
+              <div className="rounded-2xl border border-border bg-secondary/30 px-6 py-16 text-center">
+                <Eyebrow>{result.violations.length === 0 ? 'Clean' : 'No matches'}</Eyebrow>
+                <p className="mt-3 text-2xl font-medium tracking-tight md:text-3xl">
                   {result.violations.length === 0
-                    ? 'plans look clean'
-                    : 'no matches for current filter'}
+                    ? 'These plans look clean.'
+                    : 'Nothing matches the current filter.'}
                 </p>
+                {result.violations.length > 0 && (
+                  <button
+                    onClick={() => {
+                      setSeverityFilter('all');
+                      setTypeFilter('all');
+                    }}
+                    className="mt-6 rounded-full border border-border px-4 py-2 text-sm transition-colors hover:bg-foreground hover:text-background"
+                  >
+                    Clear filter
+                  </button>
+                )}
               </div>
             ) : (
               <ul className="space-y-3">
                 {filteredViolations.map((v, i) => (
-                  <li
-                    key={i}
-                    className="border border-border bg-cardSubtle px-5 py-4"
-                    style={{ borderLeftColor: severityBorder(v.severity), borderLeftWidth: 3 }}
-                  >
-                    <div className="mb-2 flex items-center gap-3">
-                      <span className="border border-border px-2 py-[2px] font-mono text-[10px] uppercase tracking-widest">
-                        {v.type}
-                      </span>
-                      <span
-                        className="font-mono text-[10px] uppercase tracking-widest"
-                        style={{ color: severityBorder(v.severity) }}
-                      >
-                        {severityLabel(v.severity)}
-                      </span>
-                      {v.section_id && (
-                        <span className="font-mono text-[10px] uppercase tracking-widest text-muted">
-                          §{v.section_id}
-                        </span>
-                      )}
-                    </div>
-                    <p className="font-sans text-sm leading-relaxed">{v.description}</p>
-                    {v.code_citation && v.type === 'compliance' && (
-                      <p className="mt-2 font-mono text-[11px] text-muted">
-                        {v.code_citation}
-                      </p>
-                    )}
-                    {v.affected_sheets && v.affected_sheets.length > 0 && v.type === 'consistency' && (
-                      <p className="mt-2 font-mono text-[11px] text-muted">
-                        sheets: {v.affected_sheets.join(', ')}
-                      </p>
-                    )}
-                    {v.location_hint && (
-                      <p className="mt-2 font-mono text-[11px] text-muted">
-                        location: {v.location_hint}
-                      </p>
-                    )}
-                  </li>
+                  <ViolationCard key={i} violation={v} />
                 ))}
               </ul>
             )}
           </div>
-        )}
-      </section>
+        </section>
+      )}
+
+      <Footer />
     </main>
   );
 }
 
-function SummaryStat({
-  label,
-  value,
-  color,
-}: {
-  label: string;
-  value: number;
-  color?: string;
-}) {
+function Header({ theme, onToggleTheme }: { theme: Theme; onToggleTheme: () => void }) {
+  return (
+    <header className="fixed inset-x-0 top-4 z-50 flex justify-center px-4 md:top-6">
+      <div className="shadow-elevated flex w-full max-w-3xl items-center justify-between gap-4 rounded-full border border-border bg-background/80 px-5 py-2.5 backdrop-blur-md">
+        <div className="flex items-baseline gap-3">
+          <span className="text-lg font-bold tracking-[-0.04em]">planq</span>
+          <span className="hidden font-mono text-[10px] uppercase tracking-widest text-muted-foreground sm:inline">
+            by staqtech
+          </span>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="hidden font-mono text-[10px] uppercase tracking-widest text-muted-foreground md:inline">
+            Code review
+          </span>
+          <button
+            onClick={onToggleTheme}
+            aria-label={`switch to ${theme === 'dark' ? 'light' : 'dark'} mode`}
+            className="rounded-full border border-border px-3 py-1.5 font-mono text-[10px] uppercase tracking-widest text-muted-foreground transition-colors hover:text-foreground"
+          >
+            {theme === 'dark' ? 'Light' : 'Dark'}
+          </button>
+        </div>
+      </div>
+    </header>
+  );
+}
+
+function Footer() {
+  return (
+    <footer className="border-t border-border px-6 py-12 md:px-12 lg:px-20">
+      <div className="mx-auto flex max-w-5xl flex-col gap-3 md:flex-row md:items-center md:justify-between">
+        <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+          planq · by staqtech
+        </p>
+        <p className="max-w-md text-xs text-muted-foreground">
+          planq is a review aid, not a substitute for a registered code consultant. Every
+          flagged issue should be verified against the authority having jurisdiction.
+        </p>
+      </div>
+    </footer>
+  );
+}
+
+function Eyebrow({ children }: { children: React.ReactNode }) {
+  return (
+    <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+      {children}
+    </p>
+  );
+}
+
+function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div>
-      <p className="font-mono text-[10px] uppercase tracking-widest text-muted">{label}</p>
-      <p className="font-sans text-xl font-bold text-fg" style={color ? { color } : undefined}>
-        {value}
-      </p>
+      <label className="mb-3 block font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+        {label}
+      </label>
+      {children}
     </div>
+  );
+}
+
+function PipelineTable({ steps }: { steps: PipelineStep[] }) {
+  return (
+    <div className="overflow-hidden rounded-2xl border border-border">
+      <div className="grid grid-cols-[auto_1fr_auto] gap-4 bg-secondary/30 px-5 py-3">
+        <Eyebrow>#</Eyebrow>
+        <Eyebrow>Stage</Eyebrow>
+        <Eyebrow>Status</Eyebrow>
+      </div>
+      {steps.map((step, i) => (
+        <div
+          key={step.label}
+          className="grid grid-cols-[auto_1fr_auto] items-center gap-4 border-t border-border px-5 py-4"
+        >
+          <span className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+            {String(i + 1).padStart(2, '0')}
+          </span>
+          <span className="text-sm">{step.label}</span>
+          <span
+            className={`font-mono text-[10px] uppercase tracking-widest ${
+              step.status === 'done'
+                ? 'text-foreground'
+                : step.status === 'active'
+                  ? 'text-foreground'
+                  : 'text-muted-foreground'
+            }`}
+          >
+            {step.status === 'done' ? 'Done' : step.status === 'active' ? 'Running…' : 'Pending'}
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function StatStrip({
+  items,
+}: {
+  items: Array<{ label: string; value: number; color?: string }>;
+}) {
+  return (
+    <div className="grid grid-cols-2 gap-px overflow-hidden rounded-2xl border border-border bg-border md:grid-cols-3 lg:grid-cols-6">
+      {items.map((item) => (
+        <div key={item.label} className="bg-background p-6">
+          <Eyebrow>{item.label}</Eyebrow>
+          <p
+            className="mt-2 text-3xl font-medium tracking-tight md:text-4xl"
+            style={item.color ? { color: item.color } : undefined}
+          >
+            {item.value}
+          </p>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ViolationCard({ violation: v }: { violation: Violation }) {
+  return (
+    <li
+      className="rounded-2xl border border-border bg-secondary/30 px-6 py-5"
+      style={{ borderLeftColor: severityColor(v.severity), borderLeftWidth: 3 }}
+    >
+      <div className="mb-3 flex flex-wrap items-center gap-2">
+        <span className="rounded-full border border-border px-2 py-[2px] font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+          {v.type}
+        </span>
+        <span
+          className="font-mono text-[10px] uppercase tracking-widest"
+          style={{ color: severityColor(v.severity) }}
+        >
+          {v.severity}
+        </span>
+        {v.section_id && (
+          <span className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+            §{v.section_id}
+          </span>
+        )}
+      </div>
+      <p className="text-sm leading-relaxed md:text-base">{v.description}</p>
+      <div className="mt-3 space-y-1">
+        {v.code_citation && v.type === 'compliance' && (
+          <p className="font-mono text-xs text-muted-foreground">{v.code_citation}</p>
+        )}
+        {v.affected_sheets && v.affected_sheets.length > 0 && v.type === 'consistency' && (
+          <p className="font-mono text-xs text-muted-foreground">
+            sheets: {v.affected_sheets.join(', ')}
+          </p>
+        )}
+        {v.location_hint && (
+          <p className="font-mono text-xs text-muted-foreground">
+            location: {v.location_hint}
+          </p>
+        )}
+      </div>
+    </li>
   );
 }
 
@@ -464,10 +576,10 @@ function FilterButton({
   return (
     <button
       onClick={onClick}
-      className={`border px-3 py-2 font-mono text-[11px] uppercase tracking-widest transition-colors ${
+      className={`rounded-full border px-4 py-2 text-xs font-medium tracking-tight transition-colors ${
         active
-          ? 'border-accent bg-accent/10 text-fg'
-          : 'border-border text-muted hover:text-fg'
+          ? 'border-foreground bg-foreground text-background'
+          : 'border-border text-muted-foreground hover:text-foreground'
       }`}
     >
       {children}
@@ -479,164 +591,199 @@ function ExtractedSheetsPanel({ sheets }: { sheets: ExtractedSheet[] }) {
   const [openIndex, setOpenIndex] = useState<number | null>(0);
 
   return (
-    <div className="border border-border">
-      <div className="border-b border-border px-5 py-3">
-        <p className="font-mono text-[10px] uppercase tracking-widest text-muted">
-          extracted plan data
-        </p>
-      </div>
-      {sheets.map((sheet, idx) => {
-        const isOpen = openIndex === idx;
-        const counts = [
-          ['rooms', sheet.rooms.length],
-          ['doors', sheet.doors.length],
-          ['corridors', sheet.corridors.length],
-          ['stairs', sheet.stairs.length],
-          ['egress', sheet.egress_paths.length],
-          ['dimensions', sheet.dimensions.length],
-        ] as const;
-        return (
-          <div key={`${sheet.sheet_name}-${idx}`} className="border-b border-border last:border-b-0">
-            <button
-              onClick={() => setOpenIndex(isOpen ? null : idx)}
-              className="flex w-full items-center justify-between px-5 py-3 text-left transition-colors hover:bg-cardHover"
+    <div>
+      <Eyebrow>Extracted plan data</Eyebrow>
+      <div className="mt-4 overflow-hidden rounded-2xl border border-border">
+        {sheets.map((sheet, idx) => {
+          const isOpen = openIndex === idx;
+          const counts = [
+            ['rooms', sheet.rooms.length],
+            ['doors', sheet.doors.length],
+            ['corridors', sheet.corridors.length],
+            ['stairs', sheet.stairs.length],
+            ['egress', sheet.egress_paths.length],
+            ['dimensions', sheet.dimensions.length],
+          ] as const;
+          return (
+            <div
+              key={`${sheet.sheet_name}-${idx}`}
+              className="border-b border-border last:border-b-0"
             >
-              <div className="flex items-center gap-3">
-                <span className="font-mono text-[10px] uppercase tracking-widest text-accent">
-                  {sheet.file_type}
-                </span>
-                <span className="font-sans text-sm">{sheet.sheet_name}</span>
-                {(sheet.occupancy_type || sheet.building_type) && (
-                  <span className="font-mono text-[10px] uppercase tracking-widest text-muted">
-                    {[sheet.occupancy_type, sheet.building_type].filter(Boolean).join(' / ')}
+              <button
+                onClick={() => setOpenIndex(isOpen ? null : idx)}
+                className="flex w-full flex-wrap items-center justify-between gap-3 bg-card px-5 py-4 text-left transition-colors hover:bg-secondary/50"
+              >
+                <div className="flex flex-wrap items-center gap-3">
+                  <span className="rounded-full border border-border px-2 py-[2px] font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+                    {sheet.file_type}
                   </span>
-                )}
-              </div>
-              <span className="font-mono text-[10px] uppercase tracking-widest text-muted">
-                {counts.map(([k, v]) => `${v} ${k}`).join('  ·  ')}
-              </span>
-            </button>
-            {isOpen && (
-              <div className="grid grid-cols-1 gap-6 border-t border-border px-5 py-4 md:grid-cols-2">
-                {(sheet.occupancy_type || sheet.building_type) && (
-                  <div className="md:col-span-2">
-                    <SectionLabel>classification</SectionLabel>
-                    <p className="font-sans text-sm">
-                      {sheet.occupancy_type ? (
-                        <>
-                          <span className="text-muted">occupancy:</span> {sheet.occupancy_type}
-                        </>
-                      ) : null}
-                      {sheet.occupancy_type && sheet.building_type ? '  ·  ' : null}
-                      {sheet.building_type ? (
-                        <>
-                          <span className="text-muted">building type:</span> {sheet.building_type}
-                        </>
-                      ) : null}
-                    </p>
-                  </div>
-                )}
-
-                <ListBlock label="rooms" empty={sheet.rooms.length === 0}>
-                  {sheet.rooms.map((r, i) => (
-                    <li key={i} className="font-sans text-sm">
-                      {r.name}
-                      {r.dimensions ? (
-                        <span className="font-mono text-[11px] text-muted"> · {r.dimensions}</span>
-                      ) : null}
-                      {r.area ? (
-                        <span className="font-mono text-[11px] text-muted"> · {r.area}</span>
-                      ) : null}
-                    </li>
-                  ))}
-                </ListBlock>
-
-                <ListBlock label="doors" empty={sheet.doors.length === 0}>
-                  {sheet.doors.map((d, i) => (
-                    <li key={i} className="font-sans text-sm">
-                      {d.location}
-                      {d.width ? (
-                        <span className="font-mono text-[11px] text-muted"> · {d.width}</span>
-                      ) : null}
-                      {d.type ? (
-                        <span className="font-mono text-[11px] text-muted"> · {d.type}</span>
-                      ) : null}
-                    </li>
-                  ))}
-                </ListBlock>
-
-                <ListBlock label="corridors" empty={sheet.corridors.length === 0}>
-                  {sheet.corridors.map((c, i) => (
-                    <li key={i} className="font-sans text-sm">
-                      {c.location}
-                      {c.width ? (
-                        <span className="font-mono text-[11px] text-muted"> · {c.width}</span>
-                      ) : null}
-                      {c.length ? (
-                        <span className="font-mono text-[11px] text-muted"> · {c.length}</span>
-                      ) : null}
-                    </li>
-                  ))}
-                </ListBlock>
-
-                <ListBlock label="stairs" empty={sheet.stairs.length === 0}>
-                  {sheet.stairs.map((s, i) => (
-                    <li key={i} className="font-sans text-sm">
-                      {s.location}
-                      {s.width ? (
-                        <span className="font-mono text-[11px] text-muted"> · w {s.width}</span>
-                      ) : null}
-                      {s.rise ? (
-                        <span className="font-mono text-[11px] text-muted"> · r {s.rise}</span>
-                      ) : null}
-                      {s.run ? (
-                        <span className="font-mono text-[11px] text-muted"> · run {s.run}</span>
-                      ) : null}
-                    </li>
-                  ))}
-                </ListBlock>
-
-                <ListBlock label="egress paths" empty={sheet.egress_paths.length === 0}>
-                  {sheet.egress_paths.map((e, i) => (
-                    <li key={i} className="font-sans text-sm">
-                      {e.from} → {e.to}
-                      {e.width ? (
-                        <span className="font-mono text-[11px] text-muted"> · {e.width}</span>
-                      ) : null}
-                    </li>
-                  ))}
-                </ListBlock>
-
-                <ListBlock label="dimensions" empty={sheet.dimensions.length === 0}>
-                  {sheet.dimensions.slice(0, 12).map((d, i) => (
-                    <li key={i} className="font-mono text-[11px]">
-                      {d.element}: {d.value} {d.unit}
-                    </li>
-                  ))}
-                  {sheet.dimensions.length > 12 && (
-                    <li className="font-mono text-[10px] text-muted">
-                      …and {sheet.dimensions.length - 12} more
-                    </li>
+                  <span className="text-sm font-medium">{sheet.sheet_name}</span>
+                  {(sheet.occupancy_type || sheet.building_type) && (
+                    <span className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+                      {[sheet.occupancy_type, sheet.building_type].filter(Boolean).join(' / ')}
+                    </span>
                   )}
-                </ListBlock>
+                </div>
+                <span className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+                  {counts.map(([k, v]) => `${v} ${k}`).join('  ·  ')}
+                </span>
+              </button>
+              {isOpen && (
+                <div className="grid grid-cols-1 gap-8 border-t border-border bg-secondary/20 px-5 py-6 md:grid-cols-2">
+                  {(sheet.occupancy_type || sheet.building_type) && (
+                    <div className="md:col-span-2">
+                      <SectionLabel>Classification</SectionLabel>
+                      <p className="text-sm">
+                        {sheet.occupancy_type ? (
+                          <>
+                            <span className="text-muted-foreground">occupancy:</span>{' '}
+                            {sheet.occupancy_type}
+                          </>
+                        ) : null}
+                        {sheet.occupancy_type && sheet.building_type ? '  ·  ' : null}
+                        {sheet.building_type ? (
+                          <>
+                            <span className="text-muted-foreground">building type:</span>{' '}
+                            {sheet.building_type}
+                          </>
+                        ) : null}
+                      </p>
+                    </div>
+                  )}
 
-                {totalAnnotationCount(sheet.annotations) > 0 && (
-                  <div className="md:col-span-2">
-                    <AnnotationsView buckets={sheet.annotations} />
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
-        );
-      })}
+                  <ListBlock label="Rooms" empty={sheet.rooms.length === 0}>
+                    {sheet.rooms.map((r, i) => (
+                      <li key={i} className="text-sm">
+                        {r.name}
+                        {r.dimensions ? (
+                          <span className="font-mono text-[11px] text-muted-foreground">
+                            {' '}
+                            · {r.dimensions}
+                          </span>
+                        ) : null}
+                        {r.area ? (
+                          <span className="font-mono text-[11px] text-muted-foreground">
+                            {' '}
+                            · {r.area}
+                          </span>
+                        ) : null}
+                      </li>
+                    ))}
+                  </ListBlock>
+
+                  <ListBlock label="Doors" empty={sheet.doors.length === 0}>
+                    {sheet.doors.map((d, i) => (
+                      <li key={i} className="text-sm">
+                        {d.location}
+                        {d.width ? (
+                          <span className="font-mono text-[11px] text-muted-foreground">
+                            {' '}
+                            · {d.width}
+                          </span>
+                        ) : null}
+                        {d.type ? (
+                          <span className="font-mono text-[11px] text-muted-foreground">
+                            {' '}
+                            · {d.type}
+                          </span>
+                        ) : null}
+                      </li>
+                    ))}
+                  </ListBlock>
+
+                  <ListBlock label="Corridors" empty={sheet.corridors.length === 0}>
+                    {sheet.corridors.map((c, i) => (
+                      <li key={i} className="text-sm">
+                        {c.location}
+                        {c.width ? (
+                          <span className="font-mono text-[11px] text-muted-foreground">
+                            {' '}
+                            · {c.width}
+                          </span>
+                        ) : null}
+                        {c.length ? (
+                          <span className="font-mono text-[11px] text-muted-foreground">
+                            {' '}
+                            · {c.length}
+                          </span>
+                        ) : null}
+                      </li>
+                    ))}
+                  </ListBlock>
+
+                  <ListBlock label="Stairs" empty={sheet.stairs.length === 0}>
+                    {sheet.stairs.map((s, i) => (
+                      <li key={i} className="text-sm">
+                        {s.location}
+                        {s.width ? (
+                          <span className="font-mono text-[11px] text-muted-foreground">
+                            {' '}
+                            · w {s.width}
+                          </span>
+                        ) : null}
+                        {s.rise ? (
+                          <span className="font-mono text-[11px] text-muted-foreground">
+                            {' '}
+                            · r {s.rise}
+                          </span>
+                        ) : null}
+                        {s.run ? (
+                          <span className="font-mono text-[11px] text-muted-foreground">
+                            {' '}
+                            · run {s.run}
+                          </span>
+                        ) : null}
+                      </li>
+                    ))}
+                  </ListBlock>
+
+                  <ListBlock label="Egress paths" empty={sheet.egress_paths.length === 0}>
+                    {sheet.egress_paths.map((e, i) => (
+                      <li key={i} className="text-sm">
+                        {e.from} → {e.to}
+                        {e.width ? (
+                          <span className="font-mono text-[11px] text-muted-foreground">
+                            {' '}
+                            · {e.width}
+                          </span>
+                        ) : null}
+                      </li>
+                    ))}
+                  </ListBlock>
+
+                  <ListBlock label="Dimensions" empty={sheet.dimensions.length === 0}>
+                    {sheet.dimensions.slice(0, 12).map((d, i) => (
+                      <li key={i} className="font-mono text-[11px]">
+                        {d.element}: {d.value} {d.unit}
+                      </li>
+                    ))}
+                    {sheet.dimensions.length > 12 && (
+                      <li className="font-mono text-[10px] text-muted-foreground">
+                        …and {sheet.dimensions.length - 12} more
+                      </li>
+                    )}
+                  </ListBlock>
+
+                  {totalAnnotationCount(sheet.annotations) > 0 && (
+                    <div className="md:col-span-2">
+                      <AnnotationsView buckets={sheet.annotations} />
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }
 
 function SectionLabel({ children }: { children: React.ReactNode }) {
   return (
-    <p className="mb-2 font-mono text-[10px] uppercase tracking-widest text-muted">{children}</p>
+    <p className="mb-2 font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+      {children}
+    </p>
   );
 }
 
@@ -653,7 +800,7 @@ function ListBlock({
     <div>
       <SectionLabel>{label}</SectionLabel>
       {empty ? (
-        <p className="font-mono text-[11px] text-muted">none</p>
+        <p className="font-mono text-[11px] text-muted-foreground">none</p>
       ) : (
         <ul className="space-y-1">{children}</ul>
       )}
@@ -664,26 +811,26 @@ function ListBlock({
 function AnnotationsView({ buckets }: { buckets: AnnotationBuckets }) {
   const [showAll, setShowAll] = useState(false);
   const groups: Array<{ label: string; items: string[]; mono?: boolean }> = [
-    { label: 'rooms (from labels)', items: buckets.rooms },
-    { label: 'doors', items: buckets.doors, mono: true },
-    { label: 'dimensions', items: buckets.dimensions, mono: true },
-    { label: 'levels', items: buckets.levels, mono: true },
-    { label: 'totals & areas', items: buckets.totals },
-    { label: 'sections / elevations', items: buckets.sections },
-    { label: 'other', items: buckets.other },
+    { label: 'Rooms (from labels)', items: buckets.rooms },
+    { label: 'Doors', items: buckets.doors, mono: true },
+    { label: 'Dimensions', items: buckets.dimensions, mono: true },
+    { label: 'Levels', items: buckets.levels, mono: true },
+    { label: 'Totals & areas', items: buckets.totals },
+    { label: 'Sections / elevations', items: buckets.sections },
+    { label: 'Other', items: buckets.other },
   ].filter((g) => g.items.length > 0);
 
   if (groups.length === 0) return null;
 
   return (
     <div>
-      <div className="mb-2 flex items-center justify-between">
-        <SectionLabel>annotations</SectionLabel>
+      <div className="mb-3 flex items-center justify-between">
+        <SectionLabel>Annotations</SectionLabel>
         <button
           onClick={() => setShowAll((v) => !v)}
-          className="font-mono text-[10px] uppercase tracking-widest text-muted hover:text-fg"
+          className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground transition-colors hover:text-foreground"
         >
-          {showAll ? 'collapse' : 'show all'}
+          {showAll ? 'Collapse' : 'Show all'}
         </button>
       </div>
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
@@ -691,21 +838,23 @@ function AnnotationsView({ buckets }: { buckets: AnnotationBuckets }) {
           const limit = showAll ? g.items.length : Math.min(8, g.items.length);
           const shown = g.items.slice(0, limit);
           return (
-            <div key={g.label} className="border border-border bg-cardSubtle px-3 py-2">
-              <p className="mb-1 font-mono text-[10px] uppercase tracking-widest text-muted">
+            <div key={g.label} className="rounded-2xl border border-border bg-card px-4 py-3">
+              <p className="mb-2 font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
                 {g.label} ({g.items.length})
               </p>
               <ul className="space-y-[2px]">
                 {shown.map((item, i) => (
                   <li
                     key={i}
-                    className={`${g.mono ? 'font-mono text-[11px]' : 'font-sans text-xs'} text-fg`}
+                    className={`${
+                      g.mono ? 'font-mono text-[11px]' : 'text-xs'
+                    } text-foreground`}
                   >
                     {item}
                   </li>
                 ))}
                 {g.items.length > limit && (
-                  <li className="font-mono text-[10px] text-muted">
+                  <li className="font-mono text-[10px] text-muted-foreground">
                     …+{g.items.length - limit} more
                   </li>
                 )}

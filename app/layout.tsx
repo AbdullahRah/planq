@@ -1,11 +1,11 @@
 import type { Metadata } from 'next';
-import { DM_Sans, JetBrains_Mono } from 'next/font/google';
+import { Inter, JetBrains_Mono } from 'next/font/google';
 import './globals.css';
 
-const dmSans = DM_Sans({
+const inter = Inter({
   subsets: ['latin'],
-  weight: ['400', '500', '700'],
-  variable: '--font-dm-sans',
+  weight: ['400', '500', '600', '700'],
+  variable: '--font-inter',
   display: 'swap',
 });
 
@@ -25,21 +25,21 @@ const themeInitScript = `
 (function() {
   try {
     var t = localStorage.getItem('planq-theme');
-    if (t !== 'light' && t !== 'dark') t = 'dark';
+    if (t !== 'light' && t !== 'dark') t = 'light';
     document.documentElement.setAttribute('data-theme', t);
   } catch (e) {
-    document.documentElement.setAttribute('data-theme', 'dark');
+    document.documentElement.setAttribute('data-theme', 'light');
   }
 })();
 `.trim();
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en" className={`${dmSans.variable} ${jetbrainsMono.variable}`} suppressHydrationWarning>
+    <html lang="en" className={`${inter.variable} ${jetbrainsMono.variable}`} suppressHydrationWarning>
       <head>
         <script dangerouslySetInnerHTML={{ __html: themeInitScript }} />
       </head>
-      <body className="bg-bg text-fg font-sans antialiased">{children}</body>
+      <body className="bg-background text-foreground font-sans antialiased">{children}</body>
     </html>
   );
 }
