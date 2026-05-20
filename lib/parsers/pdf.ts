@@ -1,45 +1,36 @@
 import pdfParse from 'pdf-parse';
-import { fromBuffer } from 'pdf2pic';
-import { promises as fs } from 'fs';
-import os from 'os';
-import path from 'path';
+import { pdfToPng } from 'pdf-to-png-converter';
 
 export interface ParsedPdf {
   text: string;
   pageImages: string[];
 }
 
+const MAX_PAGES = 12;
+
 export async function parsePdf(buffer: Buffer): Promise<ParsedPdf> {
   const parsed = await pdfParse(buffer);
   const pageCount = parsed.numpages ?? 1;
+  const pagesToProcess = Array.from(
+    { length: Math.min(pageCount, MAX_PAGES) },
+    (_, i) => i + 1,
+  );
 
-  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'planq-pdf-'));
-  const pageImages: string[] = [];
+  let pageImages: string[] = [];
   try {
-    const convert = fromBuffer(buffer, {
-      density: 150,
-      format: 'png',
-      width: 1600,
-      height: 1200,
-      savePath: tmpDir,
-      saveFilename: 'page',
+    const pages = await pdfToPng(buffer, {
+      viewportScale: 2.0,
+      pagesToProcess,
+      disableFontFace: true,
+      useSystemFonts: false,
     });
-
-    const maxPages = Math.min(pageCount, 12);
-    for (let i = 1; i <= maxPages; i++) {
-      try {
-        const result = await convert(i, { responseType: 'base64' });
-        const b64 = (result as { base64?: string }).base64;
-        if (b64) {
-          pageImages.push(`data:image/png;base64,${b64}`);
-        }
-      } catch (err) {
-        // eslint-disable-next-line no-console
-        console.error(`[pdf] page ${i} render failed`, err);
-      }
-    }
-  } finally {
-    fs.rm(tmpDir, { recursive: true, force: true }).catch(() => undefined);
+    pageImages = pages
+      .map((p) => p.content?.toString('base64'))
+      .filter((b): b is string => Boolean(b))
+      .map((b) => `data:image/png;base64,${b}`);
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('[pdf] render failed', err);
   }
 
   return { text: parsed.text ?? '', pageImages };

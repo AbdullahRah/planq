@@ -4,7 +4,8 @@ import { parsePdf } from '@/lib/parsers/pdf';
 import { parseImage } from '@/lib/parsers/image';
 import { parseDxf, DwgUnsupportedError } from '@/lib/parsers/dxf';
 import { extractSheetFromImage, mergeExtraction, delay } from '@/lib/extract';
-import { compliancePass, consistencyPass } from '@/lib/analyze';
+import { compliancePass, consistencyPass, sheetHasUsableData } from '@/lib/analyze';
+import { countCodeChunks } from '@/lib/retrieve';
 import { emptyAnnotations } from '@/lib/annotations';
 import { emptyExtractedSheet, type AnalysisResult, type ExtractedSheet, type FileType, type Violation } from '@/lib/types';
 
@@ -24,6 +25,7 @@ function summarize(
   violations: Violation[],
   sheets: ExtractedSheet[],
   planId: string,
+  warnings: string[],
 ): AnalysisResult {
   const summary = { critical: 0, major: 0, minor: 0, compliance: 0, consistency: 0 };
   for (const v of violations) {
@@ -36,6 +38,7 @@ function summarize(
     sheets,
     sheets_analyzed: sheets.length,
     summary,
+    warnings: warnings.length > 0 ? warnings : undefined,
   };
 }
 
@@ -70,6 +73,7 @@ export async function POST(req: NextRequest) {
 
   const planId = planRow.id as string;
   const sheets: ExtractedSheet[] = [];
+  const warnings: string[] = [];
   // eslint-disable-next-line no-console
   console.log(`[analyze] plan ${planId} processing ${files.length} file(s)`);
 
@@ -131,6 +135,11 @@ export async function POST(req: NextRequest) {
 
     sheets.push(extracted);
 
+    const flagged = extracted.annotations.other.filter((s) =>
+      s.startsWith('PARSE_ERROR') || s.startsWith('VISION_ERROR') || s.startsWith('EXTRACT_EMPTY'),
+    );
+    for (const f of flagged) warnings.push(`${file.name}: ${f}`);
+
     await supabaseAdmin.from('plan_sheets').insert({
       plan_id: planId,
       sheet_name: file.name,
@@ -146,17 +155,45 @@ export async function POST(req: NextRequest) {
 
   // eslint-disable-next-line no-console
   console.log('[analyze] running compliance pass');
+  const chunkCount = await countCodeChunks();
+  if (chunkCount === 0) {
+    warnings.push(
+      'building_code_chunks table is empty — ingest a code PDF (npm run ingest <pdf>) before compliance can cite sections',
+    );
+  } else if (chunkCount < 0) {
+    warnings.push('could not verify building_code_chunks table — compliance results may be degraded');
+  }
+
   const allViolations: Violation[] = [];
   for (const sheet of sheets) {
-    const v = await compliancePass(sheet);
-    allViolations.push(...v);
+    if (!sheetHasUsableData(sheet)) {
+      warnings.push(`${sheet.sheet_name}: extraction empty — skipping compliance pass`);
+      continue;
+    }
+    if (chunkCount === 0) continue;
+    try {
+      const v = await compliancePass(sheet);
+      allViolations.push(...v);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      warnings.push(`compliance pass failed for ${sheet.sheet_name}: ${msg}`);
+      // eslint-disable-next-line no-console
+      console.error('[analyze] compliance pass error', err);
+    }
     await delay(500);
   }
 
   // eslint-disable-next-line no-console
   console.log('[analyze] running consistency pass');
-  const consistency = await consistencyPass(sheets);
-  allViolations.push(...consistency);
+  try {
+    const consistency = await consistencyPass(sheets);
+    allViolations.push(...consistency);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    warnings.push(`consistency pass failed: ${msg}`);
+    // eslint-disable-next-line no-console
+    console.error('[analyze] consistency pass error', err);
+  }
 
   if (allViolations.length > 0) {
     const rows = allViolations.map((v) => ({
@@ -178,7 +215,7 @@ export async function POST(req: NextRequest) {
 
   await supabaseAdmin.from('plans').update({ status: 'complete' }).eq('id', planId);
 
-  const result = summarize(allViolations, sheets, planId);
+  const result = summarize(allViolations, sheets, planId, warnings);
   // eslint-disable-next-line no-console
   console.log(`[analyze] done — ${allViolations.length} violation(s)`);
   return NextResponse.json(result);

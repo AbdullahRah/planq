@@ -12,32 +12,82 @@ export async function embedQuery(query: string): Promise<number[]> {
   return vector as number[];
 }
 
+async function keywordFallback(query: string, limit: number): Promise<CodeChunk[]> {
+  // planq.md §5: fallback search when vector retrieval is unavailable or empty.
+  // Pick the most distinctive terms from the query and OR them across content
+  // and section_title via Postgres ilike.
+  const stop = new Set([
+    'the','and','or','for','of','to','a','an','in','on','at','by','with','from',
+    'is','are','be','requirements','minimum','maximum','width','length',
+  ]);
+  const terms = Array.from(
+    new Set(
+      query
+        .toLowerCase()
+        .split(/[^a-z0-9]+/)
+        .filter((t) => t.length >= 4 && !stop.has(t)),
+    ),
+  ).slice(0, 4);
+
+  if (terms.length === 0) return [];
+
+  const pattern = terms.map((t) => `content.ilike.%${t}%,section_title.ilike.%${t}%`).join(',');
+  const { data, error } = await supabaseAdmin
+    .from('building_code_chunks')
+    .select('id, section_id, section_title, content')
+    .or(pattern)
+    .limit(limit);
+
+  if (error) {
+    // eslint-disable-next-line no-console
+    console.error('[retrieve] keyword fallback failed', error);
+    return [];
+  }
+  return (data ?? []) as CodeChunk[];
+}
+
 export async function retrieveCodeChunks(
   query: string,
   opts: { matchThreshold?: number; matchCount?: number } = {},
 ): Promise<CodeChunk[]> {
   const { matchThreshold = 0.5, matchCount = 10 } = opts;
-  let embedding: number[];
+  let embedding: number[] | null = null;
   try {
     embedding = await embedQuery(query);
   } catch (err) {
     // eslint-disable-next-line no-console
-    console.error('[retrieve] embedding failed', err);
-    return [];
+    console.error('[retrieve] embedding failed, will try keyword fallback', err);
   }
 
-  const { data, error } = await supabaseAdmin.rpc('match_code_chunks', {
-    query_embedding: embedding,
-    match_threshold: matchThreshold,
-    match_count: matchCount,
-  });
+  if (embedding) {
+    const { data, error } = await supabaseAdmin.rpc('match_code_chunks', {
+      query_embedding: embedding,
+      match_threshold: matchThreshold,
+      match_count: matchCount,
+    });
 
+    if (error) {
+      // eslint-disable-next-line no-console
+      console.error('[retrieve] rpc match_code_chunks failed', error);
+    } else if (data && data.length > 0) {
+      return data as CodeChunk[];
+    }
+  }
+
+  // Vector path returned nothing (empty DB, low similarity, or embed error).
+  return keywordFallback(query, matchCount);
+}
+
+export async function countCodeChunks(): Promise<number> {
+  const { count, error } = await supabaseAdmin
+    .from('building_code_chunks')
+    .select('id', { count: 'exact', head: true });
   if (error) {
     // eslint-disable-next-line no-console
-    console.error('[retrieve] rpc match_code_chunks failed', error);
-    return [];
+    console.error('[retrieve] count chunks failed', error);
+    return -1;
   }
-  return (data ?? []) as CodeChunk[];
+  return count ?? 0;
 }
 
 export const COMPLIANCE_CATEGORIES = [

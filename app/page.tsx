@@ -319,6 +319,23 @@ export default function PlanqPage() {
               ]}
             />
 
+            {result.warnings && result.warnings.length > 0 && (
+              <div className="rounded-2xl border border-border bg-secondary/30 px-6 py-5">
+                <Eyebrow>Warnings</Eyebrow>
+                <ul className="mt-3 space-y-1">
+                  {result.warnings.map((w, i) => (
+                    <li
+                      key={i}
+                      className="font-mono text-xs"
+                      style={{ color: '#F59E0B' }}
+                    >
+                      {w}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
             {result.sheets && result.sheets.length > 0 && (
               <ExtractedSheetsPanel sheets={result.sheets} />
             )}

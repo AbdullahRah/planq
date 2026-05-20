@@ -1,7 +1,14 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   experimental: {
-    serverComponentsExternalPackages: ['pdf-parse', 'pdf2pic', 'sharp', 'dxf-parser'],
+    serverComponentsExternalPackages: [
+      'pdf-parse',
+      'pdf-to-png-converter',
+      'pdfjs-dist',
+      '@napi-rs/canvas',
+      'sharp',
+      'dxf-parser',
+    ],
   },
 };
 

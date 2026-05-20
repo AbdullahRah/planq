@@ -5,33 +5,17 @@ export interface ParsedImage {
   mimeType: string;
 }
 
-const MIME_BY_EXT: Record<string, string> = {
-  png: 'image/png',
-  jpg: 'image/jpeg',
-  jpeg: 'image/jpeg',
-  tif: 'image/tiff',
-  tiff: 'image/tiff',
-  webp: 'image/webp',
-};
-
-function extToMime(filename: string): string {
-  const ext = filename.split('.').pop()?.toLowerCase() ?? '';
-  return MIME_BY_EXT[ext] ?? 'image/png';
-}
-
-export async function parseImage(buffer: Buffer, filename: string): Promise<ParsedImage> {
-  let working = buffer;
-  let mimeType = extToMime(filename);
-
-  if (mimeType === 'image/tiff') {
-    working = await sharp(buffer).png().toBuffer();
-    mimeType = 'image/png';
-  } else {
-    working = await sharp(buffer)
-      .resize({ width: 1600, height: 1600, fit: 'inside', withoutEnlargement: true })
-      .toBuffer();
-  }
+export async function parseImage(buffer: Buffer, _filename: string): Promise<ParsedImage> {
+  // planq.md §2: resize/normalize, grayscale, sharpen — improves vision/OCR
+  // legibility on architectural drawings without bloating payload size.
+  const working = await sharp(buffer, { failOn: 'none' })
+    .resize({ width: 2000, height: 2000, fit: 'inside', withoutEnlargement: true })
+    .grayscale()
+    .normalize()
+    .sharpen()
+    .png({ compressionLevel: 9 })
+    .toBuffer();
 
   const base64 = working.toString('base64');
-  return { dataUrl: `data:${mimeType};base64,${base64}`, mimeType };
+  return { dataUrl: `data:image/png;base64,${base64}`, mimeType: 'image/png' };
 }

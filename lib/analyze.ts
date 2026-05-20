@@ -1,6 +1,23 @@
-import { openrouter, MODELS, safeJsonParse } from './openrouter';
+import { openrouter, MODELS, readChoiceText, safeJsonParse } from './openrouter';
 import { COMPLIANCE_CATEGORIES, retrieveCodeChunks } from './retrieve';
+import { totalAnnotationCount } from './annotations';
 import type { CodeChunk, ExtractedSheet, Violation } from './types';
+
+export function sheetHasUsableData(sheet: ExtractedSheet): boolean {
+  if (
+    sheet.rooms.length > 0 ||
+    sheet.doors.length > 0 ||
+    sheet.corridors.length > 0 ||
+    sheet.stairs.length > 0 ||
+    sheet.egress_paths.length > 0 ||
+    sheet.dimensions.length > 0
+  ) {
+    return true;
+  }
+  // Bucketed annotations can carry rescued data even when structured fields
+  // are empty — only treat the sheet as truly empty if everything is blank.
+  return totalAnnotationCount(sheet.annotations) > 0;
+}
 
 const COMPLIANCE_SYSTEM = `You are a building code compliance expert for Canada (NBC 2020 / Alberta Building Code). Given the extracted building plan data and the relevant code sections below, identify all violations. The plan's occupancy classification and building type drive WHICH part of the code applies — Part 9 (Housing & Small Buildings) for single-detached / semi-detached / row houses ≤3 storeys and ≤600 m², Part 3 (Fire Protection / Occupant Safety) for everything else (assembly, business, mercantile, larger residential). Always cite a section consistent with the stated occupancy: do not cite Part 3 thresholds (e.g. 900 mm doors) for a Part 9 dwelling, and do not cite Part 9 thresholds (e.g. 810 mm doors) for a Part 3 building. If occupancy is unstated, mention the ambiguity in the description rather than guessing. Return ONLY a JSON array of violations. Each violation must have: type ('compliance'), severity ('critical'|'major'|'minor'), description, section_id, code_citation, location_hint. Do not include any prose outside the JSON array.`;
 
@@ -18,18 +35,33 @@ function formatChunks(chunks: CodeChunk[]): string {
     .join('\n\n---\n\n');
 }
 
+function coerceType(raw: unknown, fallback: Violation['type']): Violation['type'] {
+  if (typeof raw !== 'string') return fallback;
+  const v = raw.toLowerCase();
+  if (v.includes('consist')) return 'consistency';
+  if (v.includes('compli')) return 'compliance';
+  return fallback;
+}
+
+function coerceSeverity(raw: unknown): Violation['severity'] {
+  if (typeof raw !== 'string') return 'major';
+  const v = raw.toLowerCase();
+  if (v.includes('crit') || v.includes('high') || v.includes('severe')) return 'critical';
+  if (v.includes('min') || v.includes('low')) return 'minor';
+  return 'major';
+}
+
 function normalizeViolations(input: unknown, defaults: Partial<Violation>): Violation[] {
   const arr = Array.isArray(input) ? input : [];
   const violations: Violation[] = [];
   for (const raw of arr) {
     if (!raw || typeof raw !== 'object') continue;
     const r = raw as Record<string, unknown>;
-    const type = (r.type as Violation['type']) ?? defaults.type ?? 'compliance';
-    const severity = (r.severity as Violation['severity']) ?? 'minor';
-    const description = typeof r.description === 'string' ? r.description : '';
+    const description = typeof r.description === 'string' ? r.description.trim() : '';
     if (!description) continue;
-    if (type !== 'compliance' && type !== 'consistency') continue;
-    if (severity !== 'critical' && severity !== 'major' && severity !== 'minor') continue;
+
+    const type = coerceType(r.type, defaults.type ?? 'compliance');
+    const severity = coerceSeverity(r.severity);
 
     violations.push({
       type,
@@ -47,6 +79,10 @@ function normalizeViolations(input: unknown, defaults: Partial<Violation>): Viol
 }
 
 export async function compliancePass(sheet: ExtractedSheet): Promise<Violation[]> {
+  // planq.md: skip compliance entirely when the sheet carries no usable data,
+  // otherwise the model will hallucinate violations against an empty plan.
+  if (!sheetHasUsableData(sheet)) return [];
+
   const allChunks: CodeChunk[] = [];
   const seen = new Set<string>();
   for (const cat of COMPLIANCE_CATEGORIES) {
@@ -56,6 +92,14 @@ export async function compliancePass(sheet: ExtractedSheet): Promise<Violation[]
       seen.add(c.id);
       allChunks.push(c);
     }
+  }
+
+  // No code context at all means we cannot cite anything credibly. Bail out
+  // rather than letting the model invent section numbers.
+  if (allChunks.length === 0) {
+    throw new Error(
+      'no building code chunks available — run `npm run ingest <code.pdf>` to populate the corpus',
+    );
   }
 
   const codeContext = formatChunks(allChunks);
@@ -74,18 +118,20 @@ export async function compliancePass(sheet: ExtractedSheet): Promise<Violation[]
     const completion = await openrouter.chat.completions.create({
       model: MODELS.reasoning,
       temperature: 0.1,
+      max_tokens: 4000,
       messages: [
         { role: 'system', content: COMPLIANCE_SYSTEM },
         { role: 'user', content: userContent },
       ],
+      ...({ reasoning: { exclude: true } } as Record<string, unknown>),
     });
-    const raw = completion.choices?.[0]?.message?.content ?? '';
-    const parsed = safeJsonParse<unknown>(typeof raw === 'string' ? raw : '', []);
+    const raw = readChoiceText(completion.choices?.[0]?.message as never);
+    const parsed = safeJsonParse<unknown>(raw, []);
     return normalizeViolations(parsed, { type: 'compliance', affected_sheets: [sheet.sheet_name] });
   } catch (err) {
     // eslint-disable-next-line no-console
     console.error('[analyze] compliance pass failed', err);
-    return [];
+    throw err;
   }
 }
 
@@ -98,17 +144,19 @@ export async function consistencyPass(sheets: ExtractedSheet[]): Promise<Violati
     const completion = await openrouter.chat.completions.create({
       model: MODELS.reasoning,
       temperature: 0.1,
+      max_tokens: 4000,
       messages: [
         { role: 'system', content: CONSISTENCY_SYSTEM },
         { role: 'user', content: userContent },
       ],
+      ...({ reasoning: { exclude: true } } as Record<string, unknown>),
     });
-    const raw = completion.choices?.[0]?.message?.content ?? '';
-    const parsed = safeJsonParse<unknown>(typeof raw === 'string' ? raw : '', []);
+    const raw = readChoiceText(completion.choices?.[0]?.message as never);
+    const parsed = safeJsonParse<unknown>(raw, []);
     return normalizeViolations(parsed, { type: 'consistency' });
   } catch (err) {
     // eslint-disable-next-line no-console
     console.error('[analyze] consistency pass failed', err);
-    return [];
+    throw err;
   }
 }

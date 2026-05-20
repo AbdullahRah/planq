@@ -38,6 +38,7 @@ export interface AnalysisResult {
     compliance: number;
     consistency: number;
   };
+  warnings?: string[];
 }
 
 export interface CodeChunk {

@@ -16,9 +16,23 @@ export const openrouter = new OpenAI({
 
 export const MODELS = {
   vision: process.env.VISION_MODEL ?? 'nvidia/nemotron-nano-12b-v2-vl:free',
-  reasoning: process.env.REASONING_MODEL ?? 'google/gemma-4-31b-it:free',
-  embedding: process.env.EMBEDDING_MODEL ?? 'openrouter/free',
+  reasoning: process.env.REASONING_MODEL ?? 'nvidia/nemotron-3-super-120b-a12b:free',
+  embedding: process.env.EMBEDDING_MODEL ?? 'openai/text-embedding-3-small',
 };
+
+type ChoiceMessage = {
+  content?: string | null;
+  reasoning?: string | null;
+};
+
+// Reasoning models on OpenRouter sometimes leave `content` empty and put the
+// answer in a separate `reasoning` field. Read both, prefer content.
+export function readChoiceText(message: ChoiceMessage | undefined | null): string {
+  if (!message) return '';
+  if (typeof message.content === 'string' && message.content.trim()) return message.content;
+  if (typeof message.reasoning === 'string' && message.reasoning.trim()) return message.reasoning;
+  return '';
+}
 
 export function safeJsonParse<T>(raw: string, fallback: T): T {
   if (!raw) return fallback;
