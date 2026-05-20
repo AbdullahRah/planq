@@ -12,7 +12,11 @@ export async function embedQuery(query: string): Promise<number[]> {
   return vector as number[];
 }
 
-async function keywordFallback(query: string, limit: number): Promise<CodeChunk[]> {
+async function keywordFallback(
+  query: string,
+  limit: number,
+  partPrefix?: string,
+): Promise<CodeChunk[]> {
   // planq.md §5: fallback search when vector retrieval is unavailable or empty.
   // Pick the most distinctive terms from the query and OR them across content
   // and section_title via Postgres ilike.
@@ -32,11 +36,12 @@ async function keywordFallback(query: string, limit: number): Promise<CodeChunk[
   if (terms.length === 0) return [];
 
   const pattern = terms.map((t) => `content.ilike.%${t}%,section_title.ilike.%${t}%`).join(',');
-  const { data, error } = await supabaseAdmin
+  let q = supabaseAdmin
     .from('building_code_chunks')
     .select('id, section_id, section_title, content')
-    .or(pattern)
-    .limit(limit);
+    .or(pattern);
+  if (partPrefix) q = q.like('section_id', `${partPrefix}%`);
+  const { data, error } = await q.limit(limit);
 
   if (error) {
     // eslint-disable-next-line no-console
@@ -48,9 +53,9 @@ async function keywordFallback(query: string, limit: number): Promise<CodeChunk[
 
 export async function retrieveCodeChunks(
   query: string,
-  opts: { matchThreshold?: number; matchCount?: number } = {},
+  opts: { matchThreshold?: number; matchCount?: number; partPrefix?: string } = {},
 ): Promise<CodeChunk[]> {
-  const { matchThreshold = 0.5, matchCount = 10 } = opts;
+  const { matchThreshold = 0.5, matchCount = 10, partPrefix } = opts;
   let embedding: number[] | null = null;
   try {
     embedding = await embedQuery(query);
@@ -60,22 +65,30 @@ export async function retrieveCodeChunks(
   }
 
   if (embedding) {
+    // Over-fetch and then filter to part when requested, so we still get
+    // enough chunks after filtering.
+    const overfetch = partPrefix ? Math.max(matchCount * 8, 40) : matchCount;
     const { data, error } = await supabaseAdmin.rpc('match_code_chunks', {
       query_embedding: embedding,
       match_threshold: matchThreshold,
-      match_count: matchCount,
+      match_count: overfetch,
     });
 
     if (error) {
       // eslint-disable-next-line no-console
       console.error('[retrieve] rpc match_code_chunks failed', error);
     } else if (data && data.length > 0) {
-      return data as CodeChunk[];
+      const rows = data as CodeChunk[];
+      if (partPrefix) {
+        const filtered = rows.filter((r) => (r.section_id ?? '').startsWith(partPrefix));
+        if (filtered.length > 0) return filtered.slice(0, matchCount);
+      }
+      return rows.slice(0, matchCount);
     }
   }
 
   // Vector path returned nothing (empty DB, low similarity, or embed error).
-  return keywordFallback(query, matchCount);
+  return keywordFallback(query, matchCount, partPrefix);
 }
 
 export async function countCodeChunks(): Promise<number> {

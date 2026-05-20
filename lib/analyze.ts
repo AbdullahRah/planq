@@ -1,4 +1,11 @@
-import { openrouter, MODELS, readChoiceText, safeJsonParse } from './openrouter';
+import {
+  openrouter,
+  REASONING_CHAIN,
+  readChoiceText,
+  safeJsonParse,
+  callWithModelChain,
+} from './openrouter';
+import type { ChatCompletion } from 'openai/resources/chat/completions';
 import { COMPLIANCE_CATEGORIES, retrieveCodeChunks } from './retrieve';
 import { totalAnnotationCount } from './annotations';
 import type { CodeChunk, ExtractedSheet, Violation } from './types';
@@ -19,7 +26,18 @@ export function sheetHasUsableData(sheet: ExtractedSheet): boolean {
   return totalAnnotationCount(sheet.annotations) > 0;
 }
 
-const COMPLIANCE_SYSTEM = `You are a building code compliance expert for Canada (NBC 2020 / Alberta Building Code). Given the extracted building plan data and the relevant code sections below, identify all violations. The plan's occupancy classification and building type drive WHICH part of the code applies — Part 9 (Housing & Small Buildings) for single-detached / semi-detached / row houses ≤3 storeys and ≤600 m², Part 3 (Fire Protection / Occupant Safety) for everything else (assembly, business, mercantile, larger residential). Always cite a section consistent with the stated occupancy: do not cite Part 3 thresholds (e.g. 900 mm doors) for a Part 9 dwelling, and do not cite Part 9 thresholds (e.g. 810 mm doors) for a Part 3 building. If occupancy is unstated, mention the ambiguity in the description rather than guessing. Return ONLY a JSON array of violations. Each violation must have: type ('compliance'), severity ('critical'|'major'|'minor'), description, section_id, code_citation, location_hint. Do not include any prose outside the JSON array.`;
+const COMPLIANCE_SYSTEM = `You are a building code compliance expert for Canada (NBC 2020 / Alberta Building Code). Given the extracted building plan data and the relevant code sections below, identify all violations.
+
+The plan's occupancy classification and building type drive WHICH part of the code applies — Part 9 (Housing & Small Buildings) for single-detached / semi-detached / row houses ≤3 storeys and ≤600 m², Part 3 (Fire Protection / Occupant Safety) for everything else (assembly, business, mercantile, larger residential). Always cite a section consistent with the stated occupancy. If occupancy is unstated, mention the ambiguity in the description rather than guessing.
+
+CITATION RULES — these are absolute:
+1. The "section_id" you emit MUST be a section number that appears somewhere in the provided code excerpts below (either as the chunk label in square brackets, OR mentioned inside the chunk text itself, e.g. "9.9.3.3. Width of Corridors"). The "Allowed section_id values" list further down enumerates the acceptable values — pick the most specific one that the retrieved text actually supports.
+2. Do not invent section numbers from memory. If a violation is obvious but no allowed section_id supports it, omit the "section_id" field entirely rather than guessing.
+3. Cite the deepest applicable section — prefer "9.9.3.3" over "9.9" when the more specific number appears in the text.
+4. The "code_citation" field is a short human label (e.g. "NBC 2020 Part 9, 9.9.3.3 — Width of Corridors"). The section number in it must match section_id.
+5. Find every real, observable violation in the plan data. Do not skip clear violations just because their wording is approximate — flag corridors narrower than the stated minimum, doors below the stated minimum, stairs whose run/rise/width is outside the stated range, ceiling heights below the stated minimum, etc.
+
+Return ONLY a JSON array of violations. Each violation must have: type ('compliance'), severity ('critical'|'major'|'minor'), description, section_id (from the allowed list, or omitted), code_citation, location_hint. Do not include any prose outside the JSON array. If you genuinely find no violations, return [].`;
 
 const CONSISTENCY_SYSTEM = `You are a building plan reviewer. Compare these extracted sheets from the same project. Identify all inconsistencies — dimensions that conflict between sheets, elements present on one sheet but missing on another, annotation contradictions. Return ONLY a JSON array of violations with: type ('consistency'), severity ('critical'|'major'|'minor'), description, affected_sheets (array of sheet names), location_hint. Do not include any prose outside the JSON array.`;
 
@@ -78,15 +96,34 @@ function normalizeViolations(input: unknown, defaults: Partial<Violation>): Viol
   return violations;
 }
 
+function detectPartPrefix(sheet: ExtractedSheet): string | undefined {
+  const blob = `${sheet.occupancy_type ?? ''} ${sheet.building_type ?? ''}`.toLowerCase();
+  if (!blob.trim()) return undefined;
+  if (/part\s*9|house|dwelling|residential\s*(small|low)|small\s*building/.test(blob)) return '9.';
+  if (/part\s*3|assembly|business|mercantile|industrial|institutional|high[-\s]?rise/.test(blob)) return '3.';
+  return undefined;
+}
+
 export async function compliancePass(sheet: ExtractedSheet): Promise<Violation[]> {
   // planq.md: skip compliance entirely when the sheet carries no usable data,
   // otherwise the model will hallucinate violations against an empty plan.
   if (!sheetHasUsableData(sheet)) return [];
 
+  const partPrefix = detectPartPrefix(sheet);
+  const partHint =
+    partPrefix === '9.'
+      ? 'Part 9 housing dwelling unit small building '
+      : partPrefix === '3.'
+        ? 'Part 3 fire protection major occupancy '
+        : '';
   const allChunks: CodeChunk[] = [];
   const seen = new Set<string>();
   for (const cat of COMPLIANCE_CATEGORIES) {
-    const chunks = await retrieveCodeChunks(cat.query, { matchCount: 6, matchThreshold: 0.4 });
+    const chunks = await retrieveCodeChunks(`${partHint}${cat.query}`, {
+      matchCount: 8,
+      matchThreshold: 0.3,
+      partPrefix,
+    });
     for (const c of chunks) {
       if (seen.has(c.id)) continue;
       seen.add(c.id);
@@ -105,6 +142,22 @@ export async function compliancePass(sheet: ExtractedSheet): Promise<Violation[]
   const codeContext = formatChunks(allChunks);
   const sheetJson = JSON.stringify(sheet, null, 2);
 
+  // Build the allowlist of citations. The chunker mislabels many chunks
+  // (chunk.section_id points to the preceding heading while the body is
+  // text from a different section), so also harvest any "N.N.N(.N)?"
+  // pattern that appears INSIDE the retrieved content — these are real
+  // citations the model can see and quote.
+  const SECTION_RE = /\b\d+\.\d+(?:\.\d+){0,3}\b/g;
+  const allowedSet = new Set<string>();
+  for (const c of allChunks) {
+    if (c.section_id) allowedSet.add(c.section_id.split('#')[0]);
+    if (c.content) {
+      const matches = c.content.match(SECTION_RE);
+      if (matches) for (const m of matches) allowedSet.add(m);
+    }
+  }
+  const allowedIds = Array.from(allowedSet);
+
   const occupancyLine =
     sheet.occupancy_type || sheet.building_type
       ? `Stated occupancy/building type: ${[sheet.occupancy_type, sheet.building_type]
@@ -112,22 +165,73 @@ export async function compliancePass(sheet: ExtractedSheet): Promise<Violation[]
           .join(' / ')}. Cite sections from the matching NBC Part only.`
       : 'Stated occupancy/building type: NOT SPECIFIED. Treat as ambiguous and note this in any width-threshold violations rather than assuming Part 3 or Part 9.';
 
-  const userContent = `${occupancyLine}\n\nRelevant building code sections:\n${codeContext}\n\nExtracted plan data for sheet "${sheet.sheet_name}":\n${sheetJson}\n\nReturn JSON array of violations only.`;
+  const userContent = `${occupancyLine}\n\nAllowed section_id values (cite ONLY these, otherwise omit section_id):\n${allowedIds.join(', ')}\n\nRelevant building code sections:\n${codeContext}\n\nExtracted plan data for sheet "${sheet.sheet_name}":\n${sheetJson}\n\nYour ENTIRE response must be a single valid JSON array, starting with "[" on the very first character. Do not write any preamble, analysis, or "let's think about" text — go directly to the JSON.`;
 
   try {
-    const completion = await openrouter.chat.completions.create({
-      model: MODELS.reasoning,
-      temperature: 0.1,
-      max_tokens: 4000,
-      messages: [
-        { role: 'system', content: COMPLIANCE_SYSTEM },
-        { role: 'user', content: userContent },
-      ],
-      ...({ reasoning: { exclude: true } } as Record<string, unknown>),
-    });
+    const completion = await callWithModelChain<ChatCompletion>(
+      REASONING_CHAIN,
+      (model) =>
+        openrouter.chat.completions.create({
+          model,
+          temperature: 0.1,
+          max_tokens: 8000,
+          messages: [
+            { role: 'system', content: COMPLIANCE_SYSTEM },
+            { role: 'user', content: userContent },
+          ],
+          ...({ reasoning: { exclude: true } } as Record<string, unknown>),
+        }) as Promise<ChatCompletion>,
+      (out) => {
+        const text = readChoiceText(out.choices?.[0]?.message as never);
+        return text.includes('[');
+      },
+      (info) => {
+        if (process.env.PLANQ_DEBUG) {
+          // eslint-disable-next-line no-console
+          console.log(`[analyze] compliance try ${info.model}: ${info.reason}`);
+        }
+      },
+    );
+
+    if (!completion) {
+      // eslint-disable-next-line no-console
+      console.error('[analyze] all reasoning models failed for compliance pass');
+      return [];
+    }
+
     const raw = readChoiceText(completion.choices?.[0]?.message as never);
+    if (process.env.PLANQ_DEBUG) {
+      // eslint-disable-next-line no-console
+      console.log(
+        `[analyze] raw len=${raw.length} finish=${completion.choices?.[0]?.finish_reason} usage=${JSON.stringify(completion.usage ?? {})}\n${raw.slice(0, 2000)}`,
+      );
+    }
     const parsed = safeJsonParse<unknown>(raw, []);
-    return normalizeViolations(parsed, { type: 'compliance', affected_sheets: [sheet.sheet_name] });
+    const violations = normalizeViolations(parsed, {
+      type: 'compliance',
+      affected_sheets: [sheet.sheet_name],
+    });
+    if (process.env.PLANQ_DEBUG) {
+      // eslint-disable-next-line no-console
+      console.log(`[analyze] parsed array? ${Array.isArray(parsed)}  normalized: ${violations.length}`);
+    }
+
+    // Hallucination guard: only keep section_ids that appeared in the
+    // retrieved context. Strip the citation rather than dropping the
+    // violation outright — the *observation* may still be valid.
+    return violations.map((v) => {
+      if (!v.section_id) return v;
+      const root = v.section_id.split('#')[0];
+      if (allowedSet.has(root)) return v;
+      // Also allow shorter prefixes (e.g. model cites 9.9.3.3 when content
+      // contains 9.9.3.3.(1)).
+      for (const allowed of allowedSet) {
+        if (allowed.startsWith(root + '.') || root.startsWith(allowed + '.')) return v;
+      }
+      // eslint-disable-next-line no-console
+      console.warn(`[analyze] stripping invented citation ${v.section_id}`);
+      return { ...v, section_id: undefined, code_citation: undefined };
+    });
   } catch (err) {
     // eslint-disable-next-line no-console
     console.error('[analyze] compliance pass failed', err);
@@ -138,25 +242,40 @@ export async function compliancePass(sheet: ExtractedSheet): Promise<Violation[]
 export async function consistencyPass(sheets: ExtractedSheet[]): Promise<Violation[]> {
   if (sheets.length < 2) return [];
   const sheetsJson = JSON.stringify(sheets, null, 2);
-  const userContent = `Sheets:\n${sheetsJson}\n\nReturn JSON array of consistency violations only.`;
+  const userContent = `Sheets:\n${sheetsJson}\n\nYour ENTIRE response must be a single valid JSON array, starting with "[" on the very first character. No preamble or analysis text.`;
 
-  try {
-    const completion = await openrouter.chat.completions.create({
-      model: MODELS.reasoning,
-      temperature: 0.1,
-      max_tokens: 4000,
-      messages: [
-        { role: 'system', content: CONSISTENCY_SYSTEM },
-        { role: 'user', content: userContent },
-      ],
-      ...({ reasoning: { exclude: true } } as Record<string, unknown>),
-    });
-    const raw = readChoiceText(completion.choices?.[0]?.message as never);
-    const parsed = safeJsonParse<unknown>(raw, []);
-    return normalizeViolations(parsed, { type: 'consistency' });
-  } catch (err) {
+  const completion = await callWithModelChain<ChatCompletion>(
+    REASONING_CHAIN,
+    (model) =>
+      openrouter.chat.completions.create({
+        model,
+        temperature: 0.1,
+        max_tokens: 8000,
+        messages: [
+          { role: 'system', content: CONSISTENCY_SYSTEM },
+          { role: 'user', content: userContent },
+        ],
+        ...({ reasoning: { exclude: true } } as Record<string, unknown>),
+      }) as Promise<ChatCompletion>,
+    (out) => {
+      const text = readChoiceText(out.choices?.[0]?.message as never);
+      return text.includes('[');
+    },
+    (info) => {
+      if (process.env.PLANQ_DEBUG) {
+        // eslint-disable-next-line no-console
+        console.log(`[analyze] consistency try ${info.model}: ${info.reason}`);
+      }
+    },
+  );
+
+  if (!completion) {
     // eslint-disable-next-line no-console
-    console.error('[analyze] consistency pass failed', err);
-    throw err;
+    console.error('[analyze] all reasoning models failed for consistency pass');
+    return [];
   }
+
+  const raw = readChoiceText(completion.choices?.[0]?.message as never);
+  const parsed = safeJsonParse<unknown>(raw, []);
+  return normalizeViolations(parsed, { type: 'consistency' });
 }

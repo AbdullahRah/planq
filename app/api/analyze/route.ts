@@ -68,7 +68,15 @@ export async function POST(req: NextRequest) {
   if (planErr || !planRow) {
     // eslint-disable-next-line no-console
     console.error('[analyze] failed to create plan row', planErr);
-    return NextResponse.json({ error: 'failed to create plan' }, { status: 500 });
+    return NextResponse.json(
+      {
+        error: 'failed to create plan',
+        detail: planErr?.message ?? 'unknown',
+        code: planErr?.code,
+        hint: planErr?.hint,
+      },
+      { status: 500 },
+    );
   }
 
   const planId = planRow.id as string;
