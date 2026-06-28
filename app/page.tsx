@@ -44,6 +44,23 @@ const INITIAL_STEPS: PipelineStep[] = [
   { label: 'Analyzing violations', status: 'pending' },
 ];
 
+// Rotating one-liners shown while the analysis runs, so the wait has some
+// personality. Kept building-code themed and tasteful.
+const LOADING_QUIPS = [
+  'Measuring your stairs, riser by riser…',
+  'Arguing with NBC §9.8.4.2 about tread depth…',
+  'Checking if that corridor passed the vibe (and width) check…',
+  'Politely asking the AI to squint at your floor plan…',
+  'Making sure the guardrail can survive a determined toddler…',
+  'Cross-examining your egress paths…',
+  'Counting doors. Judging doors. Measuring doors…',
+  'Consulting the fire marshal who lives in our head…',
+  'Pretending we can read the handwriting on sheet A-1…',
+  'Double-checking the math, then triple-checking it…',
+  'Confirming nobody has to duck through a doorway…',
+  'Reticulating splines… kidding. Finding real violations…',
+];
+
 export default function PlanqPage() {
   const [theme, setTheme] = useState<Theme>('light');
   useEffect(() => {
@@ -70,6 +87,8 @@ export default function PlanqPage() {
   const [dragActive, setDragActive] = useState(false);
   const [steps, setSteps] = useState<PipelineStep[]>(INITIAL_STEPS);
   const [analyzing, setAnalyzing] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [quipIdx, setQuipIdx] = useState(0);
   const [result, setResult] = useState<AnalysisResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [severityFilter, setSeverityFilter] = useState<SeverityFilter>('all');
@@ -105,12 +124,33 @@ export default function PlanqPage() {
     setSteps((prev) => prev.map((s, i) => (i === idx ? { ...s, status } : s)));
   };
 
+  // The analysis is a single POST, so there's no real per-stage progress to
+  // read. Ease the bar toward ~90% while we wait, then runAnalyze snaps it to
+  // 100% once the result lands — honest about being indeterminate.
+  useEffect(() => {
+    if (!analyzing) return;
+    setProgress((p) => (p < 8 ? 8 : p));
+    const id = setInterval(() => {
+      setProgress((p) => (p >= 90 ? p : p + Math.max(0.4, (90 - p) * 0.05)));
+    }, 350);
+    return () => clearInterval(id);
+  }, [analyzing]);
+
+  // Cycle the humorous status line every few seconds while analyzing.
+  useEffect(() => {
+    if (!analyzing) return;
+    const id = setInterval(() => setQuipIdx((i) => (i + 1) % LOADING_QUIPS.length), 2600);
+    return () => clearInterval(id);
+  }, [analyzing]);
+
   const runAnalyze = async () => {
     if (analyzing || files.length === 0) return;
     setAnalyzing(true);
     setError(null);
     setResult(null);
     setSteps(INITIAL_STEPS.map((s) => ({ ...s, status: 'pending' })));
+    setProgress(0);
+    setQuipIdx(0);
 
     advanceStep(0, 'active');
 
@@ -137,9 +177,11 @@ export default function PlanqPage() {
       }
       const json = (await res.json()) as AnalysisResult;
       advanceStep(3, 'done');
+      setProgress(100);
       setResult(json);
     } catch (err) {
       setError((err as Error).message);
+      setProgress(0);
       setSteps((prev) =>
         prev.map((s) => (s.status === 'active' ? { ...s, status: 'pending' } : s)),
       );
@@ -274,6 +316,10 @@ export default function PlanqPage() {
               </span>
             )}
           </div>
+
+          {analyzing && (
+            <LoadingProgress progress={progress} quip={LOADING_QUIPS[quipIdx]} />
+          )}
 
           {(analyzing || steps.some((s) => s.status !== 'pending')) && (
             <PipelineTable steps={steps} />
@@ -495,6 +541,35 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
         {label}
       </label>
       {children}
+    </div>
+  );
+}
+
+function LoadingProgress({ progress, quip }: { progress: number; quip: string }) {
+  const pct = Math.min(100, Math.round(progress));
+  return (
+    <div className="space-y-3 rounded-2xl border border-border p-5">
+      <div className="flex items-center justify-between gap-4">
+        <span className="text-sm text-foreground" aria-live="polite">
+          {quip}
+        </span>
+        <span className="font-mono text-[10px] uppercase tracking-widest tabular-nums text-muted-foreground">
+          {pct}%
+        </span>
+      </div>
+      <div
+        className="h-2 overflow-hidden rounded-full bg-secondary/40"
+        role="progressbar"
+        aria-valuenow={pct}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-label="Analysis progress"
+      >
+        <div
+          className="h-full rounded-full bg-foreground transition-[width] duration-500 ease-out"
+          style={{ width: `${pct}%` }}
+        />
+      </div>
     </div>
   );
 }
