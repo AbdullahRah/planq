@@ -1,6 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { SignedIn, SignedOut, SignInButton, SignUpButton, UserButton } from '@clerk/nextjs';
 import type { AnalysisResult, ExtractedSheet, FileType, Violation } from '@/lib/types';
 import { totalAnnotationCount, type AnnotationBuckets } from '@/lib/annotations';
 
@@ -442,6 +443,21 @@ function Header({ theme, onToggleTheme }: { theme: Theme; onToggleTheme: () => v
           >
             {theme === 'dark' ? 'Light' : 'Dark'}
           </button>
+          <SignedOut>
+            <SignInButton mode="modal">
+              <button className="rounded-full border border-border px-3 py-1.5 font-mono text-[10px] uppercase tracking-widest text-muted-foreground transition-colors hover:text-foreground">
+                Sign in
+              </button>
+            </SignInButton>
+            <SignUpButton mode="modal">
+              <button className="rounded-full border border-foreground bg-foreground px-3 py-1.5 font-mono text-[10px] uppercase tracking-widest text-background transition-opacity hover:opacity-80">
+                Sign up
+              </button>
+            </SignUpButton>
+          </SignedOut>
+          <SignedIn>
+            <UserButton afterSignOutUrl="/" />
+          </SignedIn>
         </div>
       </div>
     </header>
