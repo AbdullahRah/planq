@@ -7,10 +7,36 @@ import { parseToMm } from './units';
 import { detectBuildingPart } from './occupancy';
 import type { ElementType, NormalizedElement } from './types';
 
-/** Set a numeric attribute only when the source string parses to a real number. */
+// Physically plausible [min, max] in mm for each attribute. Extraction noise
+// (e.g. a "stair rise" of 2463mm — really the total rise over many risers — or a
+// 25mm "ceiling height") falls outside these and must NOT generate a violation;
+// the deterministic engine only flags values that could really be that element.
+// Bounds are wide enough to keep genuine violations (e.g. a 250mm rise, an
+// 1800mm ceiling) while excluding impossible single-element measurements.
+const SANE_MM: Record<string, [number, number]> = {
+  width_mm: [300, 4000],
+  rise_mm: [80, 300],
+  run_depth_mm: [120, 600],
+  headroom_mm: [1500, 4000],
+  handrail_height_mm: [600, 1200],
+  height_mm: [400, 2000],
+  ceiling_height_mm: [1500, 6000],
+  length_mm: [200, 200000],
+};
+
+function isPlausible(attr: string, mm: number): boolean {
+  const bounds = SANE_MM[attr];
+  return !bounds || (mm >= bounds[0] && mm <= bounds[1]);
+}
+
+/**
+ * Set a numeric attribute only when the source string parses to a real number
+ * that is physically plausible for that attribute. Implausible values are
+ * treated as extraction noise and dropped.
+ */
 function setMm(attrs: Record<string, number>, key: string, raw?: string | null): void {
   const mm = parseToMm(raw ?? null);
-  if (mm != null) attrs[key] = mm;
+  if (mm != null && isPlausible(key, mm)) attrs[key] = mm;
 }
 
 // Map a generic dimensions[] label to an (elementType, attribute) target so
@@ -86,7 +112,7 @@ export function flattenSheet(sheet: ExtractedSheet): NormalizedElement[] {
     const target = classifyDimension(dim.element ?? '');
     if (!target) return;
     const mm = parseToMm(`${dim.value ?? ''} ${dim.unit ?? ''}`.trim() || dim.value);
-    if (mm == null) return;
+    if (mm == null || !isPlausible(target.attribute, mm)) return;
     elements.push({
       ...base,
       type: target.type,
