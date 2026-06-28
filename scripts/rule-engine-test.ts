@@ -118,6 +118,19 @@ for (const s of passSheets) {
   check(`${s.sheet_name} clean`, out.violations.length === 0, `got ${out.violations.length}`);
 }
 
+// Implausible extraction noise must NOT generate violations.
+console.log('\nImplausible-value fixtures (expect 0 each):');
+const noiseSheets: ExtractedSheet[] = [
+  sheet('n1', { stairs: [{ location: 'S-x', rise: '2463mm' }] }), // total rise, not a riser
+  sheet('n2', { dimensions: [{ element: 'ceiling height', value: '25.4', unit: 'mm' }] }), // 1 inch
+  sheet('n3', { doors: [{ location: 'D-x', width: '12mm' }] }), // misparsed
+  sheet('n4', { stairs: [{ location: 'S-y', run: '5mm' }] }), // tolerance value, not a run
+];
+for (const s of noiseSheets) {
+  const out = runRuleEngine(s, RULES);
+  check(`${s.sheet_name} not flagged (noise)`, out.violations.length === 0, `got ${out.violations.length}`);
+}
+
 // v10 should produce exactly two violations (run + width).
 const v10 = runRuleEngine(violationSheets[9], RULES);
 check('v10 has 2 violations', v10.violations.length === 2, `got ${v10.violations.length}`);
