@@ -13,6 +13,7 @@
     "test:rules": "ts-node --project tsconfig.scripts.json scripts/rule-engine-test.ts"
   },
   "dependencies": {
+    "@clerk/nextjs": "^6.39.5",
     "@supabase/ssr": "^0.10.3",
     "@supabase/supabase-js": "^2.45.0",
     "dotenv": "^16.4.5",
