@@ -7,7 +7,10 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
-    "ingest": "ts-node --project tsconfig.scripts.json scripts/ingest.ts"
+    "ingest": "ts-node --project tsconfig.scripts.json scripts/ingest.ts",
+    "extract-rules": "ts-node --project tsconfig.scripts.json scripts/extract-rules.ts",
+    "ingest-rules": "ts-node --project tsconfig.scripts.json scripts/ingest-rules.ts",
+    "test:rules": "ts-node --project tsconfig.scripts.json scripts/rule-engine-test.ts"
   },
   "dependencies": {
     "@supabase/ssr": "^0.10.3",

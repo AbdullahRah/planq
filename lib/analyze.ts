@@ -9,6 +9,9 @@ import type { ChatCompletion } from 'openai/resources/chat/completions';
 import { COMPLIANCE_CATEGORIES, retrieveCodeChunks } from './retrieve';
 import { totalAnnotationCount } from './annotations';
 import type { CodeChunk, ExtractedSheet, Violation } from './types';
+import { detectBuildingPart } from './rule-engine/occupancy';
+import { loadRules } from './rule-engine/loadRules';
+import { runRuleEngine, type RuleEngineOutput } from './rule-engine/runner';
 
 export function sheetHasUsableData(sheet: ExtractedSheet): boolean {
   if (
@@ -97,11 +100,25 @@ function normalizeViolations(input: unknown, defaults: Partial<Violation>): Viol
 }
 
 function detectPartPrefix(sheet: ExtractedSheet): string | undefined {
-  const blob = `${sheet.occupancy_type ?? ''} ${sheet.building_type ?? ''}`.toLowerCase();
-  if (!blob.trim()) return undefined;
-  if (/part\s*9|house|dwelling|residential\s*(small|low)|small\s*building/.test(blob)) return '9.';
-  if (/part\s*3|assembly|business|mercantile|industrial|institutional|high[-\s]?rise/.test(blob)) return '3.';
+  // Shared classifier so the LLM retrieval path and the deterministic rule
+  // engine agree on Part 9 vs Part 3 (lib/rule-engine/occupancy.ts).
+  const part = detectBuildingPart(sheet.occupancy_type, sheet.building_type);
+  if (part === 'Part9') return '9.';
+  if (part === 'Part3') return '3.';
   return undefined;
+}
+
+/**
+ * Deterministic compliance pass: load the code_rules table and evaluate the
+ * sheet's extracted measurements arithmetically. Runs before the LLM pass; the
+ * returned coveredSections let the caller dedupe LLM output. Never throws —
+ * an empty/unpopulated rules table just yields no violations.
+ */
+export async function ruleEnginePass(sheet: ExtractedSheet): Promise<RuleEngineOutput> {
+  if (!sheetHasUsableData(sheet)) return { violations: [], coveredSections: new Set() };
+  const rules = await loadRules();
+  if (rules.length === 0) return { violations: [], coveredSections: new Set() };
+  return runRuleEngine(sheet, rules);
 }
 
 export async function compliancePass(sheet: ExtractedSheet): Promise<Violation[]> {

@@ -4,7 +4,7 @@ import { parsePdf } from '@/lib/parsers/pdf';
 import { parseImage } from '@/lib/parsers/image';
 import { parseDxf, DwgUnsupportedError } from '@/lib/parsers/dxf';
 import { extractSheetFromImage, mergeExtraction, delay } from '@/lib/extract';
-import { compliancePass, consistencyPass, sheetHasUsableData } from '@/lib/analyze';
+import { compliancePass, consistencyPass, ruleEnginePass, sheetHasUsableData } from '@/lib/analyze';
 import { countCodeChunks } from '@/lib/retrieve';
 import { emptyAnnotations } from '@/lib/annotations';
 import { emptyExtractedSheet, type AnalysisResult, type ExtractedSheet, type FileType, type Violation } from '@/lib/types';
@@ -178,10 +178,29 @@ export async function POST(req: NextRequest) {
       warnings.push(`${sheet.sheet_name}: extraction empty — skipping compliance pass`);
       continue;
     }
+
+    // Deterministic rule engine first — exact, instant, no model call. Records
+    // which sections it covered so the LLM pass below can be deduped against it.
+    let coveredSections = new Set<string>();
+    try {
+      const ruleOut = await ruleEnginePass(sheet);
+      allViolations.push(...ruleOut.violations);
+      coveredSections = ruleOut.coveredSections;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      warnings.push(`rule engine failed for ${sheet.sheet_name}: ${msg}`);
+      // eslint-disable-next-line no-console
+      console.error('[analyze] rule engine error', err);
+    }
+
     if (chunkCount === 0) continue;
     try {
       const v = await compliancePass(sheet);
-      allViolations.push(...v);
+      // Dedupe: drop LLM findings that cite a section the rule engine already
+      // flagged for this sheet; tag the survivors as LLM-sourced.
+      const deduped = v.filter((lv) => !(lv.section_id && coveredSections.has(lv.section_id)));
+      for (const lv of deduped) lv.source = 'llm';
+      allViolations.push(...deduped);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       warnings.push(`compliance pass failed for ${sheet.sheet_name}: ${msg}`);
@@ -195,6 +214,7 @@ export async function POST(req: NextRequest) {
   console.log('[analyze] running consistency pass');
   try {
     const consistency = await consistencyPass(sheets);
+    for (const cv of consistency) cv.source = 'llm';
     allViolations.push(...consistency);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -213,6 +233,7 @@ export async function POST(req: NextRequest) {
       code_citation: v.code_citation ?? null,
       affected_sheets: v.affected_sheets ?? null,
       location_hint: v.location_hint ?? null,
+      source: v.source ?? null,
     }));
     const { error: vErr } = await supabaseAdmin.from('violations').insert(rows);
     if (vErr) {
