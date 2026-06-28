@@ -24,6 +24,8 @@ export interface Violation {
   code_citation?: string;
   affected_sheets?: string[];
   location_hint?: string;
+  // Provenance: 'rule_engine' for deterministic checks, 'llm' for model output.
+  source?: 'rule_engine' | 'llm';
 }
 
 export interface AnalysisResult {

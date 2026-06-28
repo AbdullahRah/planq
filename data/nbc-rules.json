@@ -1,0 +1,111 @@
+[
+  {
+    "id": "nbc-9.8.4.1-rise",
+    "section": "9.8.4.1",
+    "title": "Rise of Steps",
+    "part": "9",
+    "element_type": "stair",
+    "attribute": "rise_mm",
+    "operator": "between",
+    "value": 125,
+    "value_max": 200,
+    "severity": "major",
+    "message": "Stair rise {value}mm is outside the permitted {min}-{max}mm range (NBC §9.8.4.1, Table 9.8.4.1). Public stairs are further limited to a 180mm maximum."
+  },
+  {
+    "id": "nbc-9.8.4.2-run",
+    "section": "9.8.4.2",
+    "title": "Run of Steps",
+    "part": "9",
+    "element_type": "stair",
+    "attribute": "run_depth_mm",
+    "operator": "gte",
+    "value": 255,
+    "severity": "major",
+    "message": "Stair run {value}mm is below the {min}mm minimum for private stairs (NBC §9.8.4.2, Table 9.8.4.2). Public stairs require at least 280mm."
+  },
+  {
+    "id": "nbc-9.8.2.1-width",
+    "section": "9.8.2.1",
+    "title": "Minimum Width of Stairs",
+    "part": "9",
+    "element_type": "stair",
+    "attribute": "width_mm",
+    "operator": "gte",
+    "value": 860,
+    "severity": "major",
+    "message": "Stair width {value}mm is below the {min}mm minimum (NBC §9.8.2.1). Required exit/public stairs serving non-residential occupancies require more."
+  },
+  {
+    "id": "nbc-9.8.2.2-headroom",
+    "section": "9.8.2.2",
+    "title": "Stair Headroom",
+    "part": "9",
+    "element_type": "stair",
+    "attribute": "headroom_mm",
+    "operator": "gte",
+    "value": 1950,
+    "severity": "major",
+    "message": "Stair headroom {value}mm is below the {min}mm minimum (NBC §9.8.2.2); headroom must be at least 1950mm plus the height of one riser."
+  },
+  {
+    "id": "nbc-9.5.3-doorway-width",
+    "section": "9.5.3",
+    "title": "Doorway Width",
+    "part": "9",
+    "element_type": "door",
+    "attribute": "width_mm",
+    "operator": "gte",
+    "value": 810,
+    "severity": "minor",
+    "message": "Door width {value}mm is below the {min}mm minimum for required/barrier-free doorways (NBC §9.5.3). Verify the doorway's role before actioning."
+  },
+  {
+    "id": "nbc-9.9.3.3-corridor-width",
+    "section": "9.9.3.3",
+    "title": "Width of Corridors",
+    "part": "9",
+    "element_type": "corridor",
+    "attribute": "width_mm",
+    "operator": "gte",
+    "value": 1100,
+    "severity": "minor",
+    "message": "Corridor width {value}mm is below the {min}mm minimum for a public, public-use or exit corridor (NBC §9.9.3.3). In-suite corridors are exempt."
+  },
+  {
+    "id": "nbc-9.5.3.1-ceiling-height",
+    "section": "9.5.3.1",
+    "title": "Room Ceiling Heights",
+    "part": "9",
+    "element_type": "room",
+    "attribute": "ceiling_height_mm",
+    "operator": "gte",
+    "value": 1950,
+    "severity": "minor",
+    "message": "Ceiling height {value}mm is below the {min}mm absolute minimum (NBC §9.5.3.1, Table 9.5.3.1). Most habitable rooms require 2100mm over the required area."
+  },
+  {
+    "id": "nbc-9.8.8.3-guard-height",
+    "section": "9.8.8.3",
+    "title": "Height of Guards",
+    "part": "9",
+    "element_type": "guard",
+    "attribute": "height_mm",
+    "operator": "gte",
+    "value": 900,
+    "severity": "critical",
+    "message": "Guard height {value}mm is below the {min}mm minimum (NBC §9.8.8.3). Guards other than within a dwelling unit must be at least 1070mm high."
+  },
+  {
+    "id": "nbc-9.9.3.2-exit-width",
+    "section": "9.9.3.2",
+    "title": "Exit Width",
+    "part": "9",
+    "element_type": "egress",
+    "attribute": "width_mm",
+    "operator": "gte",
+    "value": 900,
+    "severity": "major",
+    "message": "Exit facility width {value}mm is below the {min}mm minimum (NBC §9.9.3.2)."
+  }
+]
