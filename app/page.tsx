@@ -555,6 +555,54 @@ function StatStrip({
   );
 }
 
+/**
+ * What stands behind a finding, in one badge. A deterministic finding is
+ * arithmetic against the rules table; a model-authored one carries the verdict
+ * of the TypeSafe verification gate (lib/verify.ts). Anything short of
+ * "verified" says so plainly rather than looking like settled fact.
+ */
+function ProvenanceBadge({ violation: v }: { violation: Violation }) {
+  const base =
+    'rounded-full border px-2 py-[2px] font-mono text-[10px] uppercase tracking-widest';
+
+  if (v.source === 'rule_engine') {
+    return (
+      <span className={`${base} border-emerald-500/40 text-emerald-500`} title="Measured against the code rules table — arithmetic, not a model judgement">
+        measured
+      </span>
+    );
+  }
+
+  const ver = v.verification;
+  if (!ver) return null;
+
+  const pct = (n?: number) => (n == null ? '' : ` ${Math.round(n * 100)}%`);
+
+  if (ver.verdict === 'verified') {
+    return (
+      <span
+        className={`${base} border-emerald-500/40 text-emerald-500`}
+        title={`Checked against the text of the cited section by ${ver.model ?? 'the verifier'}${pct(ver.relation_confidence)} confidence`}
+      >
+        verified{pct(ver.relation_confidence)}
+      </span>
+    );
+  }
+
+  const label =
+    ver.verdict === 'unsupported'
+      ? 'citation unverified'
+      : ver.verdict === 'unchecked'
+        ? 'unchecked'
+        : 'needs review';
+
+  return (
+    <span className={`${base} border-amber-500/40 text-amber-500`} title={ver.note ?? label}>
+      {label}
+    </span>
+  );
+}
+
 function ViolationCard({ violation: v }: { violation: Violation }) {
   return (
     <li
@@ -576,6 +624,7 @@ function ViolationCard({ violation: v }: { violation: Violation }) {
             §{v.section_id}
           </span>
         )}
+        <ProvenanceBadge violation={v} />
       </div>
       <p className="text-sm leading-relaxed md:text-base">{v.description}</p>
       <div className="mt-3 space-y-1">

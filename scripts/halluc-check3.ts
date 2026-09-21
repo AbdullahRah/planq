@@ -28,11 +28,15 @@ async function main() {
 
   console.log('--- compliance pass ---');
   const start = Date.now();
-  const violations = await compliancePass(sheet);
+  const { violations, dropped } = await compliancePass(sheet);
   const elapsed = Date.now() - start;
-  console.log(`${violations.length} violations in ${elapsed}ms\n`);
+  console.log(`${violations.length} violations in ${elapsed}ms (${dropped.length} dropped by verification)\n`);
   for (const v of violations) {
-    console.log(`  [${v.severity}] §${v.section_id ?? '—'} ${v.description.slice(0, 160)}`);
+    const ver = v.verification ? ` {${v.verification.verdict}}` : '';
+    console.log(`  [${v.severity}] §${v.section_id ?? '—'}${ver} ${v.description.slice(0, 160)}`);
+  }
+  for (const d of dropped) {
+    console.log(`  DROPPED {${d.verification.verdict}} ${d.violation.description.slice(0, 140)}`);
   }
 
   const cited = Array.from(new Set(violations.map((v) => v.section_id).filter(Boolean) as string[]));
