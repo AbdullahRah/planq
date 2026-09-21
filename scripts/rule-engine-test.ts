@@ -2,7 +2,7 @@
 // Self-contained harness for the deterministic rule engine — no DB, no env.
 // Mirrors the repo's runnable "probe" style (there is no jest). Exits non-zero
 // on any mismatch. Covers parseToMm + 10 known-violation / 10 known-pass sheets.
-import { parseToMm } from '../lib/rule-engine/units';
+import { parseDimension, parseToMm } from '../lib/rule-engine/units';
 import { runRuleEngine } from '../lib/rule-engine/runner';
 import type { CodeRule } from '../lib/rule-engine/types';
 import { emptyExtractedSheet, type ExtractedSheet } from '../lib/types';
@@ -117,6 +117,81 @@ for (const s of passSheets) {
   const out = runRuleEngine(s, RULES);
   check(`${s.sheet_name} clean`, out.violations.length === 0, `got ${out.violations.length}`);
 }
+
+// Implausible extraction noise must NOT generate violations.
+console.log('\nImplausible-value fixtures (expect 0 each):');
+const noiseSheets: ExtractedSheet[] = [
+  sheet('n1', { stairs: [{ location: 'S-x', rise: '2463mm' }] }), // total rise, not a riser
+  sheet('n2', { dimensions: [{ element: 'ceiling height', value: '25.4', unit: 'mm' }] }), // 1 inch
+  sheet('n3', { doors: [{ location: 'D-x', width: '12mm' }] }), // misparsed
+  sheet('n4', { stairs: [{ location: 'S-y', run: '5mm' }] }), // tolerance value, not a run
+];
+for (const s of noiseSheets) {
+  const out = runRuleEngine(s, RULES);
+  check(`${s.sheet_name} not flagged (noise)`, out.violations.length === 0, `got ${out.violations.length}`);
+}
+
+// ---- unit provenance ----
+console.log('\nparseDimension unit provenance:');
+check('"900mm" is explicit', parseDimension('900mm')?.explicitUnit === true);
+check('"0.9 m" is explicit', parseDimension('0.9 m')?.explicitUnit === true);
+check('"900" is unitless', parseDimension('900')?.explicitUnit === false);
+
+// Unitless numbers must be rescued when exactly one unit reading is physically
+// possible — this is where "no remarks" came from on plans that label metres.
+console.log('\nUnitless-value fixtures:');
+const unitlessFlag: Array<[string, ExtractedSheet]> = [
+  ['u1 ceiling "2.0" read as metres', sheet('u1', { dimensions: [{ element: 'ceiling height', value: '2.0', unit: '' }] })],
+  ['u2 door "0.75" read as metres', sheet('u2', { doors: [{ location: 'D-1', width: '0.75' }] })],
+];
+for (const [name, s2] of unitlessFlag) {
+  const out = runRuleEngine(s2, RULES);
+  check(name, out.violations.length === 1, `got ${out.violations.length}`);
+}
+// "36" is plausible as both centimetres (360mm) and inches (914mm) — refuse it
+// rather than guess a violation into existence.
+const ambiguous = runRuleEngine(sheet('u3', { doors: [{ location: 'D-2', width: '36' }] }), RULES);
+check('u3 ambiguous unit not flagged', ambiguous.violations.length === 0, `got ${ambiguous.violations.length}`);
+check('u3 reports why it was skipped', ambiguous.skipped.some((n) => n.reason === 'ambiguous-unit'));
+
+// ---- guardrails against false positives ----
+console.log('\nFalse-positive guards (expect 0 each):');
+const part3Sheet: ExtractedSheet = {
+  ...emptyExtractedSheet('g1', 'pdf'),
+  occupancy_type: 'business office',
+  building_type: 'high-rise office building',
+  doors: [{ location: 'D-1', width: '750mm' }],
+};
+const g1 = runRuleEngine(part3Sheet, RULES);
+check('g1 Part 9 rules do not fire on a Part 3 building', g1.violations.length === 0, `got ${g1.violations.length}`);
+
+const guardSheets: Array<[string, ExtractedSheet]> = [
+  ['g2 closet door exempt from doorway width', sheet('g2', { doors: [{ location: 'D-4 closet', width: '700mm' }] })],
+  ['g3 wardrobe door exempt', sheet('g3', { doors: [{ location: 'BR-2', type: 'wardrobe', width: '600mm' }] })],
+  ['g4 in-suite corridor exempt', sheet('g4', { corridors: [{ location: 'in-suite corridor', width: '800mm' }] })],
+  ['g5 "total rise" is not a riser', sheet('g5', { dimensions: [{ element: 'total rise', value: '2463', unit: 'mm' }] })],
+];
+for (const [name, s2] of guardSheets) {
+  const out = runRuleEngine(s2, RULES);
+  check(name, out.violations.length === 0, `got ${out.violations.length}`);
+}
+
+// A Part 9 building still gets Part 9 checks.
+const part9Door = runRuleEngine(sheet('g6', { doors: [{ location: 'D-1', width: '750mm' }] }), RULES);
+check('g6 Part 9 door still flagged', part9Door.violations.length === 1, `got ${part9Door.violations.length}`);
+
+// Multi-page extractions merge into one sheet, repeating the same element.
+const dupe = runRuleEngine(
+  sheet('g7', {
+    doors: [
+      { location: 'D-1', width: '750mm' },
+      { location: 'D-1', width: '750mm' },
+      { location: 'D-1', width: '750mm' },
+    ],
+  }),
+  RULES,
+);
+check('g7 repeated element reported once', dupe.violations.length === 1, `got ${dupe.violations.length}`);
 
 // v10 should produce exactly two violations (run + width).
 const v10 = runRuleEngine(violationSheets[9], RULES);

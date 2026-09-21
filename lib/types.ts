@@ -16,6 +16,28 @@ export interface ExtractedSheet {
   building_type?: string;
 }
 
+/**
+ * The outcome of the TypeSafe (Jev) verification gate for a model-authored
+ * finding. See lib/verify.ts. Rule-engine findings are never verified this way
+ * and carry no verification block.
+ */
+export interface ViolationVerification {
+  /**
+   * verified      — the cited section supports the requirement and the plan shows the element
+   * unsupported   — the cited section does not address the requirement; citation was removed
+   * contradicted  — the cited section states a different requirement (finding dropped)
+   * ungrounded    — the extracted plan data does not contain the element (finding dropped)
+   * needs_review  — the model was not confident enough to decide on its own
+   * unchecked     — verification was disabled or unavailable
+   */
+  verdict: 'verified' | 'unsupported' | 'contradicted' | 'ungrounded' | 'needs_review' | 'unchecked';
+  relation?: 'supports' | 'contradicts' | 'says_nothing';
+  relation_confidence?: number;
+  grounded?: number;
+  model?: string;
+  note?: string;
+}
+
 export interface Violation {
   type: 'compliance' | 'consistency';
   severity: 'critical' | 'major' | 'minor';
@@ -26,6 +48,8 @@ export interface Violation {
   location_hint?: string;
   // Provenance: 'rule_engine' for deterministic checks, 'llm' for model output.
   source?: 'rule_engine' | 'llm';
+  // Present only on model-authored findings that went through lib/verify.ts.
+  verification?: ViolationVerification;
 }
 
 export interface AnalysisResult {

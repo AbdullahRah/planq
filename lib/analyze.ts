@@ -8,8 +8,10 @@ import {
 import type { ChatCompletion } from 'openai/resources/chat/completions';
 import { COMPLIANCE_CATEGORIES, retrieveCodeChunks } from './retrieve';
 import { totalAnnotationCount } from './annotations';
-import type { CodeChunk, ExtractedSheet, Violation } from './types';
-import { detectBuildingPart } from './rule-engine/occupancy';
+import type { CodeChunk, ExtractedSheet, Violation, ViolationVerification } from './types';
+import { verifyViolations } from './verify';
+import { rerankChunks } from './rerank';
+import { detectBuildingPart, type BuildingPart } from './rule-engine/occupancy';
 import { loadRules } from './rule-engine/loadRules';
 import { runRuleEngine, type RuleEngineOutput } from './rule-engine/runner';
 
@@ -99,10 +101,34 @@ function normalizeViolations(input: unknown, defaults: Partial<Violation>): Viol
   return violations;
 }
 
-function detectPartPrefix(sheet: ExtractedSheet): string | undefined {
+/**
+ * Collapse repeat findings. A multi-page sheet is merged into one extraction, so
+ * the model routinely reports the same corridor or door once per page; the UI
+ * showed those as separate violations and inflated every count.
+ */
+export function dedupeViolations(violations: Violation[]): Violation[] {
+  const seen = new Set<string>();
+  const out: Violation[] = [];
+  for (const v of violations) {
+    const key = [
+      v.type,
+      (v.affected_sheets ?? []).join(','),
+      v.section_id ?? '',
+      (v.location_hint ?? '').toLowerCase().trim(),
+      v.description.toLowerCase().replace(/\s+/g, ' ').trim(),
+    ].join('|');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(v);
+  }
+  return out;
+}
+
+function detectPartPrefix(sheet: ExtractedSheet, partOverride?: BuildingPart): string | undefined {
   // Shared classifier so the LLM retrieval path and the deterministic rule
-  // engine agree on Part 9 vs Part 3 (lib/rule-engine/occupancy.ts).
-  const part = detectBuildingPart(sheet.occupancy_type, sheet.building_type);
+  // engine agree on Part 9 vs Part 3 (lib/rule-engine/occupancy.ts), plus the
+  // resolved override when the sheet text alone was not enough.
+  const part = partOverride ?? detectBuildingPart(sheet.occupancy_type, sheet.building_type);
   if (part === 'Part9') return '9.';
   if (part === 'Part3') return '3.';
   return undefined;
@@ -114,19 +140,72 @@ function detectPartPrefix(sheet: ExtractedSheet): string | undefined {
  * returned coveredSections let the caller dedupe LLM output. Never throws —
  * an empty/unpopulated rules table just yields no violations.
  */
-export async function ruleEnginePass(sheet: ExtractedSheet): Promise<RuleEngineOutput> {
-  if (!sheetHasUsableData(sheet)) return { violations: [], coveredSections: new Set() };
+export async function ruleEnginePass(
+  sheet: ExtractedSheet,
+  opts: { buildingPart?: BuildingPart } = {},
+): Promise<RuleEngineOutput> {
+  const empty: RuleEngineOutput = { violations: [], coveredSections: new Set(), skipped: [] };
+  if (!sheetHasUsableData(sheet)) return empty;
   const rules = await loadRules();
-  if (rules.length === 0) return { violations: [], coveredSections: new Set() };
-  return runRuleEngine(sheet, rules);
+  if (rules.length === 0) return empty;
+  return runRuleEngine(sheet, rules, opts.buildingPart);
 }
 
-export async function compliancePass(sheet: ExtractedSheet): Promise<Violation[]> {
+/**
+ * The set of section numbers the model is permitted to cite, harvested from a
+ * chunk set.
+ *
+ * The chunker mislabels many chunks (chunk.section_id points at the preceding
+ * heading while the body is text from a different section), so this also
+ * harvests any "N.N.N(.N)?" pattern appearing INSIDE the retrieved content —
+ * those are real citations the model can see and quote.
+ *
+ * Harvesting bare "N.N" from prose also swept up measurements ("2.4 m", "1.8"),
+ * which let the model pass off a dimension as a citation. Only in-body numbers
+ * that look like a real NBC section are accepted: a Part number (1-12) followed
+ * by at least two more components. Chunk labels are trusted as-is.
+ *
+ * This set is why reranking matters: it grows with every irrelevant chunk that
+ * reaches the prompt. scripts/rerank-eval.ts measures that directly.
+ */
+export function harvestAllowedSections(chunks: CodeChunk[]): Set<string> {
+  const SECTION_RE = /\b(\d{1,2})\.\d+(?:\.\d+){1,3}\b/g;
+  const allowed = new Set<string>();
+  for (const c of chunks) {
+    if (c.section_id) allowed.add(c.section_id.split('#')[0]);
+    if (c.content) {
+      const matches = c.content.match(SECTION_RE);
+      if (matches) {
+        for (const m of matches) {
+          const part = Number(m.split('.')[0]);
+          if (part >= 1 && part <= 12) allowed.add(m);
+        }
+      }
+    }
+  }
+  return allowed;
+}
+
+export interface CompliancePassOutput {
+  /** Findings that survived the citation guard and the verification gate. */
+  violations: Violation[];
+  /**
+   * Findings the verification gate removed, with the reason. Never discarded
+   * silently — the caller reports these so "no violations" can always be told
+   * apart from "the checks threw everything away".
+   */
+  dropped: Array<{ violation: Violation; verification: ViolationVerification }>;
+}
+
+export async function compliancePass(
+  sheet: ExtractedSheet,
+  opts: { coveredSections?: Set<string>; buildingPart?: BuildingPart } = {},
+): Promise<CompliancePassOutput> {
   // planq.md: skip compliance entirely when the sheet carries no usable data,
   // otherwise the model will hallucinate violations against an empty plan.
-  if (!sheetHasUsableData(sheet)) return [];
+  if (!sheetHasUsableData(sheet)) return { violations: [], dropped: [] };
 
-  const partPrefix = detectPartPrefix(sheet);
+  const partPrefix = detectPartPrefix(sheet, opts.buildingPart);
   const partHint =
     partPrefix === '9.'
       ? 'Part 9 housing dwelling unit small building '
@@ -135,17 +214,43 @@ export async function compliancePass(sheet: ExtractedSheet): Promise<Violation[]
         : '';
   const allChunks: CodeChunk[] = [];
   const seen = new Set<string>();
+  let retrieved = 0;
+  let reranked = false;
   for (const cat of COMPLIANCE_CATEGORIES) {
-    const chunks = await retrieveCodeChunks(`${partHint}${cat.query}`, {
+    // Fast search: over-fetch a plausible shortlist.
+    const shortlist = await retrieveCodeChunks(`${partHint}${cat.query}`, {
       matchCount: 8,
       matchThreshold: 0.3,
       partPrefix,
     });
-    for (const c of chunks) {
+    retrieved += shortlist.length;
+
+    // Rerank: keep only the passages that actually state a requirement for this
+    // category. Fewer chunks means a narrower citation allowlist below, which
+    // is the whole point — the allowlist is harvested from chunk bodies, so
+    // irrelevant chunks widen what the model is permitted to cite.
+    const ranked = await rerankChunks(`${cat.key}: ${cat.query}`, shortlist);
+    reranked = reranked || ranked.ranked;
+    if (process.env.PLANQ_DEBUG) {
+      for (const s of ranked.scored) {
+        // eslint-disable-next-line no-console
+        console.log(
+          `[analyze] rerank ${cat.key} ${s.chunk.section_id ?? '—'} relevance=${s.relevance?.toFixed(2) ?? 'n/a'}`,
+        );
+      }
+    }
+
+    for (const c of ranked.kept) {
       if (seen.has(c.id)) continue;
       seen.add(c.id);
       allChunks.push(c);
     }
+  }
+  if (process.env.PLANQ_DEBUG) {
+    // eslint-disable-next-line no-console
+    console.log(
+      `[analyze] retrieval: ${retrieved} candidates -> ${allChunks.length} chunks (reranked=${reranked})`,
+    );
   }
 
   // No code context at all means we cannot cite anything credibly. Bail out
@@ -159,20 +264,8 @@ export async function compliancePass(sheet: ExtractedSheet): Promise<Violation[]
   const codeContext = formatChunks(allChunks);
   const sheetJson = JSON.stringify(sheet, null, 2);
 
-  // Build the allowlist of citations. The chunker mislabels many chunks
-  // (chunk.section_id points to the preceding heading while the body is
-  // text from a different section), so also harvest any "N.N.N(.N)?"
-  // pattern that appears INSIDE the retrieved content — these are real
-  // citations the model can see and quote.
-  const SECTION_RE = /\b\d+\.\d+(?:\.\d+){0,3}\b/g;
-  const allowedSet = new Set<string>();
-  for (const c of allChunks) {
-    if (c.section_id) allowedSet.add(c.section_id.split('#')[0]);
-    if (c.content) {
-      const matches = c.content.match(SECTION_RE);
-      if (matches) for (const m of matches) allowedSet.add(m);
-    }
-  }
+  // Narrower chunk set (post-rerank) means a narrower allowlist.
+  const allowedSet = harvestAllowedSections(allChunks);
   const allowedIds = Array.from(allowedSet);
 
   const occupancyLine =
@@ -213,7 +306,7 @@ export async function compliancePass(sheet: ExtractedSheet): Promise<Violation[]
     if (!completion) {
       // eslint-disable-next-line no-console
       console.error('[analyze] all reasoning models failed for compliance pass');
-      return [];
+      return { violations: [], dropped: [] };
     }
 
     const raw = readChoiceText(completion.choices?.[0]?.message as never);
@@ -236,9 +329,21 @@ export async function compliancePass(sheet: ExtractedSheet): Promise<Violation[]
     // Hallucination guard: only keep section_ids that appeared in the
     // retrieved context. Strip the citation rather than dropping the
     // violation outright — the *observation* may still be valid.
-    return violations.map((v) => {
+    const strip = (v: Violation): Violation => ({
+      ...v,
+      section_id: undefined,
+      code_citation: undefined,
+    });
+    const guarded = violations.map((v) => {
       if (!v.section_id) return v;
       const root = v.section_id.split('#')[0];
+      // A Part 9 plan cited against Part 3 (or vice versa) is wrong even when
+      // the number exists in the corpus — retrieval mixes parts.
+      if (partPrefix && !root.startsWith(partPrefix)) {
+        // eslint-disable-next-line no-console
+        console.warn(`[analyze] stripping cross-part citation ${v.section_id}`);
+        return strip(v);
+      }
       if (allowedSet.has(root)) return v;
       // Also allow shorter prefixes (e.g. model cites 9.9.3.3 when content
       // contains 9.9.3.3.(1)).
@@ -247,8 +352,22 @@ export async function compliancePass(sheet: ExtractedSheet): Promise<Violation[]
       }
       // eslint-disable-next-line no-console
       console.warn(`[analyze] stripping invented citation ${v.section_id}`);
-      return { ...v, section_id: undefined, code_citation: undefined };
+      return strip(v);
     });
+
+    const deduped = dedupeViolations(guarded);
+
+    // Drop what the deterministic engine already flagged for this sheet before
+    // spending a verification call on it.
+    const covered = opts.coveredSections;
+    const fresh = covered
+      ? deduped.filter((v) => !(v.section_id && covered.has(v.section_id)))
+      : deduped;
+    for (const v of fresh) v.source = 'llm';
+
+    // The citation allowlist above only proves the number was on screen. This
+    // asks whether the section actually carries the requirement being claimed.
+    return verifyViolations(fresh, sheet, allChunks);
   } catch (err) {
     // eslint-disable-next-line no-console
     console.error('[analyze] compliance pass failed', err);
@@ -294,5 +413,5 @@ export async function consistencyPass(sheets: ExtractedSheet[]): Promise<Violati
 
   const raw = readChoiceText(completion.choices?.[0]?.message as never);
   const parsed = safeJsonParse<unknown>(raw, []);
-  return normalizeViolations(parsed, { type: 'consistency' });
+  return dedupeViolations(normalizeViolations(parsed, { type: 'consistency' }));
 }

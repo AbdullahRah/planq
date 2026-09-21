@@ -25,6 +25,227 @@ const SYSTEM_PROMPT = `You are a building plan analyzer. Extract all spatial and
 
 const TEXT_ONLY_SYSTEM_PROMPT = `You are a building plan analyzer. The drawing image could not be processed by the vision model — work only from the embedded text that was extracted from the plan. Extract whatever spatial and dimensional information you can confidently infer from labels, schedules, and notes. Return ONLY valid JSON matching this schema:\n${EXTRACTION_SCHEMA}\nIf a field cannot be inferred from the text, return an empty array. Do not invent data. Do not include any prose outside the JSON.`;
 
+// ---------------------------------------------------------------------------
+// Shape coercion.
+//
+// The vision model is asked for one object matching EXTRACTION_SCHEMA, but it
+// regularly answers with a bare array of rooms, or with its own key names
+// ("room_name", "clear_width", dimensions as ["7307mm","3606mm"]). The merge
+// step reads only the schema keys, so those answers used to be dropped whole and
+// the sheet was reported as "extraction empty" — a plan with 40 dimensions on it
+// silently produced no remarks. Coerce the model's shape into the schema instead.
+// ---------------------------------------------------------------------------
+
+type AnyRecord = Record<string, unknown>;
+
+function isRecord(v: unknown): v is AnyRecord {
+  return !!v && typeof v === 'object' && !Array.isArray(v);
+}
+
+/** Flatten a model-supplied scalar/array/{value,unit} into the schema's string. */
+function toText(v: unknown): string | undefined {
+  if (v == null) return undefined;
+  if (typeof v === 'string') return v.trim() || undefined;
+  if (typeof v === 'number') return Number.isFinite(v) ? String(v) : undefined;
+  if (Array.isArray(v)) {
+    const parts = v.map(toText).filter((x): x is string => !!x);
+    return parts.length > 0 ? parts.join(' x ') : undefined;
+  }
+  if (isRecord(v)) {
+    const value = toText(v.value ?? v.width ?? v.size ?? v.dimension);
+    if (!value) return undefined;
+    const unit = typeof v.unit === 'string' ? v.unit.trim() : '';
+    return unit ? `${value} ${unit}` : value;
+  }
+  return undefined;
+}
+
+function pickText(o: AnyRecord, keys: string[]): string | undefined {
+  for (const k of keys) {
+    if (k in o) {
+      const t = toText(o[k]);
+      if (t) return t;
+    }
+  }
+  return undefined;
+}
+
+const KEYS = {
+  name: ['name', 'room_name', 'room', 'space', 'label', 'title'],
+  location: ['location', 'id', 'tag', 'ref', 'name', 'label', 'room', 'position'],
+  width: ['width', 'clear_width', 'door_width', 'width_mm', 'w', 'size'],
+  length: ['length', 'len', 'length_mm', 'depth'],
+  dimensions: ['dimensions', 'dimension', 'size', 'dims', 'measurements'],
+  area: ['area', 'floor_area', 'room_area'],
+  rise: ['rise', 'riser', 'rise_height', 'riser_height'],
+  run: ['run', 'tread', 'going', 'run_depth', 'tread_depth'],
+  type: ['type', 'door_type', 'swing', 'room_type', 'category'],
+  from: ['from', 'origin', 'start', 'source'],
+  to: ['to', 'destination', 'end', 'target'],
+  element: ['element', 'label', 'name', 'description', 'item', 'component'],
+  value: ['value', 'dimension', 'measurement', 'size', 'length'],
+};
+
+type Bucket = 'rooms' | 'doors' | 'corridors' | 'stairs' | 'egress_paths' | 'dimensions';
+
+/** Guess which schema array an untagged object belongs in. */
+function classifyItem(o: AnyRecord): Bucket | null {
+  const keys = Object.keys(o).map((k) => k.toLowerCase());
+  const text = `${keys.join(' ')} ${Object.values(o)
+    .filter((v) => typeof v === 'string')
+    .join(' ')}`.toLowerCase();
+
+  if (keys.some((k) => KEYS.rise.includes(k) || KEYS.run.includes(k)) || /\bstair|\bstep/.test(text)) {
+    return 'stairs';
+  }
+  if (/\bdoor|doorway/.test(text)) return 'doors';
+  if (/corridor|hallway|\bhall\b/.test(text)) return 'corridors';
+  if (keys.includes('from') && keys.includes('to')) return 'egress_paths';
+  if (/egress|\bexit\b/.test(text)) return 'egress_paths';
+  if (keys.some((k) => KEYS.element.includes(k)) && keys.some((k) => KEYS.value.includes(k))) {
+    return 'dimensions';
+  }
+  if (keys.some((k) => KEYS.name.includes(k))) return 'rooms';
+  return null;
+}
+
+function normalizeItem(bucket: Bucket, o: AnyRecord): AnyRecord | null {
+  switch (bucket) {
+    case 'rooms': {
+      const name = pickText(o, KEYS.name);
+      if (!name) return null;
+      return { name, dimensions: pickText(o, KEYS.dimensions), area: pickText(o, KEYS.area) };
+    }
+    case 'doors':
+      return {
+        location: pickText(o, KEYS.location) ?? 'door',
+        width: pickText(o, KEYS.width),
+        type: pickText(o, KEYS.type),
+      };
+    case 'corridors':
+      return {
+        location: pickText(o, KEYS.location) ?? 'corridor',
+        width: pickText(o, KEYS.width),
+        length: pickText(o, KEYS.length),
+      };
+    case 'stairs':
+      return {
+        location: pickText(o, KEYS.location) ?? 'stair',
+        width: pickText(o, KEYS.width),
+        rise: pickText(o, KEYS.rise),
+        run: pickText(o, KEYS.run),
+      };
+    case 'egress_paths':
+      return {
+        from: pickText(o, KEYS.from) ?? '',
+        to: pickText(o, KEYS.to) ?? '',
+        width: pickText(o, KEYS.width),
+      };
+    case 'dimensions': {
+      const element = pickText(o, KEYS.element);
+      const value = pickText(o, KEYS.value);
+      if (!element || !value) return null;
+      return { element, value, unit: pickText(o, ['unit', 'units']) ?? '' };
+    }
+    default:
+      return null;
+  }
+}
+
+const BUCKET_ALIASES: Record<string, Bucket> = {
+  rooms: 'rooms',
+  spaces: 'rooms',
+  room_list: 'rooms',
+  doors: 'doors',
+  doorways: 'doors',
+  corridors: 'corridors',
+  hallways: 'corridors',
+  stairs: 'stairs',
+  stairways: 'stairs',
+  staircases: 'stairs',
+  egress_paths: 'egress_paths',
+  egress: 'egress_paths',
+  exits: 'egress_paths',
+  dimensions: 'dimensions',
+  dims: 'dimensions',
+  measurements: 'dimensions',
+};
+
+/**
+ * Reshape whatever the model returned into a RawExtraction. Accepts the schema
+ * object, a bare array of elements, or an object using synonym keys.
+ */
+export function coerceExtraction(parsed: unknown): RawExtraction {
+  const out: RawExtraction = {};
+  const push = (bucket: Bucket, item: unknown) => {
+    if (!isRecord(item)) return;
+    const normalized = normalizeItem(bucket, item);
+    if (!normalized) return;
+    const list = (out[bucket] as AnyRecord[] | undefined) ?? [];
+    list.push(normalized);
+    (out as AnyRecord)[bucket] = list;
+  };
+
+  if (Array.isArray(parsed)) {
+    for (const item of parsed) {
+      if (!isRecord(item)) continue;
+      const bucket = classifyItem(item);
+      if (bucket) push(bucket, item);
+    }
+    return out;
+  }
+
+  if (!isRecord(parsed)) return out;
+
+  for (const [key, value] of Object.entries(parsed)) {
+    const bucket = BUCKET_ALIASES[key.toLowerCase()];
+    if (bucket && Array.isArray(value)) {
+      for (const item of value) push(bucket, item);
+      continue;
+    }
+    if (key === 'annotations' || key === 'notes') {
+      if (Array.isArray(value)) {
+        out.annotations = value.filter((v): v is string => typeof v === 'string');
+      } else if (isAnnotationBuckets(value)) {
+        out.annotations = value;
+      }
+      continue;
+    }
+    if (key === 'occupancy_type' || key === 'occupancy') {
+      const t = toText(value);
+      if (t) out.occupancy_type = t;
+      continue;
+    }
+    if (key === 'building_type' || key === 'sheet_type') {
+      const t = toText(value);
+      if (t) out.building_type = t;
+      continue;
+    }
+    // An unrecognised key holding element-shaped objects (e.g. "floor_plan":
+    // [{room_name: …}]) still carries real data — classify it item by item.
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        if (!isRecord(item)) continue;
+        const guessed = classifyItem(item);
+        if (guessed) push(guessed, item);
+      }
+    }
+  }
+
+  return out;
+}
+
+export function extractionIsEmpty(e: RawExtraction): boolean {
+  return (
+    (e.rooms?.length ?? 0) === 0 &&
+    (e.doors?.length ?? 0) === 0 &&
+    (e.corridors?.length ?? 0) === 0 &&
+    (e.stairs?.length ?? 0) === 0 &&
+    (e.egress_paths?.length ?? 0) === 0 &&
+    (e.dimensions?.length ?? 0) === 0
+  );
+}
+
 async function extractFromText(args: {
   sheetName: string;
   fileType: FileType;
@@ -50,7 +271,7 @@ async function extractFromText(args: {
       ...({ reasoning: { exclude: true } } as Record<string, unknown>),
     });
     const raw = readChoiceText(completion.choices?.[0]?.message as never);
-    const parsed = safeJsonParse<RawExtraction>(raw, {} as RawExtraction);
+    const parsed = coerceExtraction(safeJsonParse<unknown>(raw, {}));
     return { extraction: parsed };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -99,7 +320,7 @@ async function extractOnePage(args: {
     });
 
     const raw = readChoiceText(completion.choices?.[0]?.message as never);
-    const parsed = safeJsonParse<RawExtraction>(raw, {} as RawExtraction);
+    const parsed = coerceExtraction(safeJsonParse<unknown>(raw, {}));
     return { extraction: parsed, raw };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -222,9 +443,13 @@ export async function extractSheetFromImage(args: {
 
   // planq.md fallback: if vision returned nothing usable but we still have
   // embedded PDF text, try a text-only pass with the reasoning model before
-  // giving up. This rescues text-heavy plans when the free vision model fails.
+  // giving up. This rescues text-heavy plans when the vision model fails.
+  // The fallback runs whenever the vision result is unusable — not only when the
+  // model was silent — because a reply we could not map to the schema leaves us
+  // just as empty as no reply at all.
   const visionFailed = isEmpty && !nonEmptyContent;
-  if (visionFailed && textHint && textHint.trim().length >= 20) {
+  const contentIgnored = isEmpty && nonEmptyContent;
+  if (isEmpty && textHint && textHint.trim().length >= 20) {
     const fallback = await extractFromText({ sheetName, fileType, text: textHint });
     if (fallback.extraction && Object.keys(fallback.extraction).length > 0) {
       const rescued = combineExtractions(sheetName, fileType, [fallback.extraction], textHint);
@@ -260,6 +485,14 @@ export async function extractSheetFromImage(args: {
       other: [
         ...merged.annotations.other,
         'EXTRACT_EMPTY: vision model returned no usable content',
+      ],
+    };
+  } else if (contentIgnored) {
+    merged.annotations = {
+      ...merged.annotations,
+      other: [
+        ...merged.annotations.other,
+        'EXTRACT_UNPARSED: vision model replied but nothing matched the extraction schema',
       ],
     };
   }

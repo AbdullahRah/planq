@@ -10,12 +10,21 @@
     "ingest": "ts-node --project tsconfig.scripts.json scripts/ingest.ts",
     "extract-rules": "ts-node --project tsconfig.scripts.json scripts/extract-rules.ts",
     "ingest-rules": "ts-node --project tsconfig.scripts.json scripts/ingest-rules.ts",
-    "test:rules": "ts-node --project tsconfig.scripts.json scripts/rule-engine-test.ts"
+    "test:rules": "ts-node --project tsconfig.scripts.json scripts/rule-engine-test.ts",
+    "test:extract": "ts-node --project tsconfig.scripts.json scripts/extract-shape-test.ts",
+    "test": "npm run test:rules && npm run test:extract && npm run test:verify && npm run test:rerank",
+    "rules:diff": "ts-node --project tsconfig.scripts.json scripts/rule-diff.ts",
+    "test:verify": "ts-node --project tsconfig.scripts.json scripts/verify-test.ts",
+    "verify:eval": "ts-node --project tsconfig.scripts.json scripts/verify-eval.ts",
+    "rerank:eval": "ts-node --project tsconfig.scripts.json scripts/rerank-eval.ts",
+    "test:rerank": "ts-node --project tsconfig.scripts.json scripts/rerank-test.ts",
+    "occupancy:eval": "ts-node --project tsconfig.scripts.json scripts/occupancy-eval.ts"
   },
   "dependencies": {
     "@clerk/nextjs": "^6.39.5",
     "@supabase/ssr": "^0.10.3",
     "@supabase/supabase-js": "^2.45.0",
+    "@typesafe-ai/sdk": "^0.6.0",
     "dotenv": "^16.4.5",
     "dxf-parser": "^1.1.2",
     "next": "14.2.35",

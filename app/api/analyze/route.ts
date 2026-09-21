@@ -4,8 +4,15 @@ import { parsePdf } from '@/lib/parsers/pdf';
 import { parseImage } from '@/lib/parsers/image';
 import { parseDxf, DwgUnsupportedError } from '@/lib/parsers/dxf';
 import { extractSheetFromImage, mergeExtraction, delay } from '@/lib/extract';
-import { compliancePass, consistencyPass, ruleEnginePass, sheetHasUsableData } from '@/lib/analyze';
+import {
+  compliancePass,
+  consistencyPass,
+  dedupeViolations,
+  ruleEnginePass,
+  sheetHasUsableData,
+} from '@/lib/analyze';
 import { countCodeChunks } from '@/lib/retrieve';
+import { resolveBuildingPart } from '@/lib/occupancy-resolve';
 import { emptyAnnotations } from '@/lib/annotations';
 import { emptyExtractedSheet, type AnalysisResult, type ExtractedSheet, type FileType, type Violation } from '@/lib/types';
 
@@ -144,7 +151,10 @@ export async function POST(req: NextRequest) {
     sheets.push(extracted);
 
     const flagged = extracted.annotations.other.filter((s) =>
-      s.startsWith('PARSE_ERROR') || s.startsWith('VISION_ERROR') || s.startsWith('EXTRACT_EMPTY'),
+      s.startsWith('PARSE_ERROR') ||
+      s.startsWith('VISION_ERROR') ||
+      s.startsWith('EXTRACT_EMPTY') ||
+      s.startsWith('EXTRACT_UNPARSED'),
     );
     for (const f of flagged) warnings.push(`${file.name}: ${f}`);
 
@@ -179,13 +189,39 @@ export async function POST(req: NextRequest) {
       continue;
     }
 
+    // Resolve which NBC Part governs this sheet once, so the deterministic
+    // engine and the LLM pass cannot disagree. The sheet's own text wins; Jev is
+    // consulted only when it is silent, and only above a high confidence bar.
+    const resolvedPart = await resolveBuildingPart(sheet);
+    if (resolvedPart.note) {
+      warnings.push(`${sheet.sheet_name}: ${resolvedPart.note}`);
+    }
+
     // Deterministic rule engine first — exact, instant, no model call. Records
     // which sections it covered so the LLM pass below can be deduped against it.
     let coveredSections = new Set<string>();
     try {
-      const ruleOut = await ruleEnginePass(sheet);
+      const ruleOut = await ruleEnginePass(sheet, { buildingPart: resolvedPart.part });
       allViolations.push(...ruleOut.violations);
       coveredSections = ruleOut.coveredSections;
+      // Say what the guardrails threw away, so "no violations" is never
+      // indistinguishable from "nothing was measurable".
+      for (const note of ruleOut.skipped.slice(0, 8)) {
+        warnings.push(
+          `${sheet.sheet_name}: ignored ${note.attribute.replace(/_mm$/, '')} "${note.raw}" on ${
+            note.element
+          } — ${
+            note.reason === 'ambiguous-unit'
+              ? 'no unit given and the value is plausible in more than one unit'
+              : 'not a physically plausible value for that element'
+          }`,
+        );
+      }
+      if (ruleOut.skipped.length > 8) {
+        warnings.push(
+          `${sheet.sheet_name}: ${ruleOut.skipped.length - 8} further unusable measurement(s) ignored`,
+        );
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       warnings.push(`rule engine failed for ${sheet.sheet_name}: ${msg}`);
@@ -195,12 +231,30 @@ export async function POST(req: NextRequest) {
 
     if (chunkCount === 0) continue;
     try {
-      const v = await compliancePass(sheet);
-      // Dedupe: drop LLM findings that cite a section the rule engine already
-      // flagged for this sheet; tag the survivors as LLM-sourced.
-      const deduped = v.filter((lv) => !(lv.section_id && coveredSections.has(lv.section_id)));
-      for (const lv of deduped) lv.source = 'llm';
-      allViolations.push(...deduped);
+      // compliancePass dedupes against the rule engine's sections, tags the
+      // survivors as LLM-sourced, and runs them through the TypeSafe (Jev)
+      // verification gate before returning.
+      const { violations: llmViolations, dropped } = await compliancePass(sheet, {
+        coveredSections,
+        buildingPart: resolvedPart.part,
+      });
+      allViolations.push(...llmViolations);
+
+      // A finding the gate removed is reported, never silently dropped.
+      for (const d of dropped) {
+        warnings.push(
+          `${sheet.sheet_name}: discarded unverifiable finding — ${d.violation.description} (${d.verification.verdict}: ${d.verification.note ?? 'no reason given'})`,
+        );
+      }
+      // Surviving findings the gate could not fully stand behind are flagged so
+      // a reviewer knows which ones still need a human.
+      for (const v of llmViolations) {
+        const ver = v.verification;
+        if (!ver || ver.verdict === 'verified') continue;
+        warnings.push(
+          `${sheet.sheet_name}: finding needs review (${ver.verdict}) — ${v.description}${ver.note ? ` [${ver.note}]` : ''}`,
+        );
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       warnings.push(`compliance pass failed for ${sheet.sheet_name}: ${msg}`);
@@ -223,8 +277,12 @@ export async function POST(req: NextRequest) {
     console.error('[analyze] consistency pass error', err);
   }
 
-  if (allViolations.length > 0) {
-    const rows = allViolations.map((v) => ({
+  // One physical element measured on several pages must not read as several
+  // violations.
+  const finalViolations = dedupeViolations(allViolations);
+
+  if (finalViolations.length > 0) {
+    const rows = finalViolations.map((v) => ({
       plan_id: planId,
       type: v.type,
       severity: v.severity,
@@ -234,6 +292,7 @@ export async function POST(req: NextRequest) {
       affected_sheets: v.affected_sheets ?? null,
       location_hint: v.location_hint ?? null,
       source: v.source ?? null,
+      verification: v.verification ?? null,
     }));
     const { error: vErr } = await supabaseAdmin.from('violations').insert(rows);
     if (vErr) {
@@ -244,8 +303,8 @@ export async function POST(req: NextRequest) {
 
   await supabaseAdmin.from('plans').update({ status: 'complete' }).eq('id', planId);
 
-  const result = summarize(allViolations, sheets, planId, warnings);
+  const result = summarize(finalViolations, sheets, planId, warnings);
   // eslint-disable-next-line no-console
-  console.log(`[analyze] done — ${allViolations.length} violation(s)`);
+  console.log(`[analyze] done — ${finalViolations.length} violation(s)`);
   return NextResponse.json(result);
 }

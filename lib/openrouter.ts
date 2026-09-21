@@ -15,24 +15,25 @@ export const openrouter = new OpenAI({
 });
 
 export const MODELS = {
-  vision: process.env.VISION_MODEL ?? 'nvidia/nemotron-nano-12b-v2-vl:free',
-  reasoning: process.env.REASONING_MODEL ?? 'openai/gpt-oss-120b:free',
+  // Cheap, reliable, multimodal defaults. Free :free models are heavily
+  // rate-limited (429) on accounts under $10 of credits, which makes them
+  // unusable in practice — gemini-2.5-flash-lite is ~$0.003 per analysis.
+  vision: process.env.VISION_MODEL ?? 'google/gemini-2.5-flash-lite',
+  reasoning: process.env.REASONING_MODEL ?? 'google/gemini-2.5-flash-lite',
   embedding: process.env.EMBEDDING_MODEL ?? 'openai/text-embedding-3-small',
 };
 
-// Ordered candidates tried when the primary reasoning model is rate-limited
-// or returns empty. Free tiers thrash, so keep a short diversified chain of
-// models that are verified-available via the OpenRouter free tier.
+// Ordered candidates tried when the primary model is rate-limited or returns
+// empty. Paid-first for reliability; a single :free model sits at the end as a
+// zero-cost last resort (it will often 429, but costs nothing to try).
 export const REASONING_CHAIN: string[] = (
   process.env.REASONING_MODEL_CHAIN
     ? process.env.REASONING_MODEL_CHAIN.split(',').map((s) => s.trim()).filter(Boolean)
     : [
         MODELS.reasoning,
-        'openai/gpt-oss-120b:free',
+        'openai/gpt-4o-mini',
+        'meta-llama/llama-3.3-70b-instruct',
         'meta-llama/llama-3.3-70b-instruct:free',
-        'google/gemma-4-31b-it:free',
-        'z-ai/glm-4.5-air:free',
-        'qwen/qwen3-next-80b-a3b-instruct:free',
       ]
 );
 
@@ -41,7 +42,8 @@ export const VISION_CHAIN: string[] = (
     ? process.env.VISION_MODEL_CHAIN.split(',').map((s) => s.trim()).filter(Boolean)
     : [
         MODELS.vision,
-        'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free',
+        'openai/gpt-4o-mini',
+        'qwen/qwen2.5-vl-72b-instruct',
       ]
 );
 
