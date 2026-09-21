@@ -107,3 +107,22 @@ export function totalAnnotationCount(b: AnnotationBuckets): number {
     b.other.length
   );
 }
+
+/**
+ * Markers the pipeline writes into `annotations.other` to record that a stage
+ * failed or fell back. They are diagnostics about the extraction, not content
+ * read off the drawing, so they must never be counted as evidence that a sheet
+ * carries usable data — a sheet whose only "content" is the note explaining it
+ * could not be read is still an unread sheet.
+ */
+export const DIAGNOSTIC_PREFIXES = [
+  'PARSE_ERROR',
+  'VISION_ERROR',
+  'EXTRACT_EMPTY',
+  'EXTRACT_UNPARSED',
+  'EXTRACT_FALLBACK',
+] as const;
+
+export function isDiagnosticMarker(note: string): boolean {
+  return DIAGNOSTIC_PREFIXES.some((p) => note.startsWith(p));
+}
