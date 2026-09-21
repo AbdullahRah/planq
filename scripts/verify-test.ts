@@ -12,6 +12,8 @@ process.env.SUPABASE_SERVICE_ROLE_KEY ||= 'stub-service-key';
 process.env.TYPESAFE_API_KEY ||= 'stub-typesafe-key';
 
 import { applyPolicy, codeTextForSection, planDataForSheet, verifyViolations, type Judgment } from '../lib/verify';
+import { sheetHasUsableData } from '../lib/analyze';
+import { isDiagnosticMarker } from '../lib/annotations';
 import { THRESHOLDS } from '../lib/typesafe';
 import { emptyAnnotations } from '../lib/annotations';
 import type { CodeChunk, ExtractedSheet, Violation } from '../lib/types';
@@ -135,6 +137,56 @@ console.log('\napplyPolicy — an outage never deletes findings:');
   check('is kept', p.action === 'keep');
   check('is marked unchecked', p.verification.verdict === 'unchecked');
   check('says why', (p.verification.note ?? '').includes('connection reset'));
+}
+
+
+console.log('\nsheetHasUsableData — a failed extraction is not usable data:');
+{
+  const marker = (note: string): ExtractedSheet => ({
+    ...SHEET,
+    rooms: [],
+    doors: [],
+    corridors: [],
+    stairs: [],
+    egress_paths: [],
+    dimensions: [],
+    occupancy_type: undefined,
+    building_type: undefined,
+    annotations: { ...emptyAnnotations(), other: [note] },
+  });
+
+  check(
+    'a sheet whose only annotation is EXTRACT_EMPTY is not usable',
+    !sheetHasUsableData(marker('EXTRACT_EMPTY: pdf renderer produced no page images')),
+    'otherwise a sheet that could not be read reaches the compliance pass',
+  );
+  check('a PARSE_ERROR sheet is not usable', !sheetHasUsableData(marker('PARSE_ERROR: boom')));
+  check('a VISION_ERROR sheet is not usable', !sheetHasUsableData(marker('VISION_ERROR: boom')));
+  check(
+    'the marker does not mask real rescued content',
+    sheetHasUsableData({
+      ...marker('EXTRACT_FALLBACK: used embedded text only'),
+      annotations: {
+        ...emptyAnnotations(),
+        other: ['EXTRACT_FALLBACK: used embedded text only'],
+        rooms: ['BEDROOM 2 3000 x 3600'],
+      },
+    }),
+    'a fallback that rescued something is still usable',
+  );
+  check('a sheet with structured data is usable', sheetHasUsableData(SHEET));
+}
+
+console.log('\nisDiagnosticMarker:');
+{
+  check('recognises every prefix the pipeline writes', [
+    'PARSE_ERROR: x',
+    'VISION_ERROR: x',
+    'EXTRACT_EMPTY: x',
+    'EXTRACT_UNPARSED: x',
+    'EXTRACT_FALLBACK: x',
+  ].every(isDiagnosticMarker));
+  check('leaves real annotations alone', !isDiagnosticMarker('CEILING HEIGHT 2440'));
 }
 
 console.log('\nverifyViolations end-to-end (injected judge):');

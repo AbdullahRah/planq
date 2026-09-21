@@ -7,7 +7,7 @@ import {
 } from './openrouter';
 import type { ChatCompletion } from 'openai/resources/chat/completions';
 import { COMPLIANCE_CATEGORIES, retrieveCodeChunks } from './retrieve';
-import { totalAnnotationCount } from './annotations';
+import { isDiagnosticMarker, totalAnnotationCount } from './annotations';
 import type { CodeChunk, ExtractedSheet, Violation, ViolationVerification } from './types';
 import { verifyViolations } from './verify';
 import { rerankChunks } from './rerank';
@@ -27,8 +27,13 @@ export function sheetHasUsableData(sheet: ExtractedSheet): boolean {
     return true;
   }
   // Bucketed annotations can carry rescued data even when structured fields
-  // are empty — only treat the sheet as truly empty if everything is blank.
-  return totalAnnotationCount(sheet.annotations) > 0;
+  // are empty — but the pipeline also writes its own failure markers into
+  // `other`, and those must not count. A sheet whose only annotation is
+  // "EXTRACT_EMPTY: pdf renderer produced no page images" read as usable, so a
+  // sheet that could not be read went to the compliance pass anyway and the
+  // model wrote findings about a plan it had never seen.
+  const markers = sheet.annotations.other.filter(isDiagnosticMarker).length;
+  return totalAnnotationCount(sheet.annotations) - markers > 0;
 }
 
 const COMPLIANCE_SYSTEM = `You are a building code compliance expert for Canada (NBC 2020 / Alberta Building Code). Given the extracted building plan data and the relevant code sections below, identify all violations.

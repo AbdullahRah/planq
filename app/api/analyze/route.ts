@@ -13,7 +13,7 @@ import {
 } from '@/lib/analyze';
 import { countCodeChunks } from '@/lib/retrieve';
 import { resolveBuildingPart } from '@/lib/occupancy-resolve';
-import { emptyAnnotations } from '@/lib/annotations';
+import { emptyAnnotations, isDiagnosticMarker } from '@/lib/annotations';
 import { emptyExtractedSheet, type AnalysisResult, type ExtractedSheet, type FileType, type Violation } from '@/lib/types';
 
 export const runtime = 'nodejs';
@@ -121,6 +121,7 @@ export async function POST(req: NextRequest) {
           fileType,
           imageDataUrls: pdf.pageImages,
           textHint: pdf.text,
+          renderError: pdf.renderError,
         });
       } else if (fileType === 'image') {
         const img = await parseImage(buffer, file.name);
@@ -150,12 +151,7 @@ export async function POST(req: NextRequest) {
 
     sheets.push(extracted);
 
-    const flagged = extracted.annotations.other.filter((s) =>
-      s.startsWith('PARSE_ERROR') ||
-      s.startsWith('VISION_ERROR') ||
-      s.startsWith('EXTRACT_EMPTY') ||
-      s.startsWith('EXTRACT_UNPARSED'),
-    );
+    const flagged = extracted.annotations.other.filter(isDiagnosticMarker);
     for (const f of flagged) warnings.push(`${file.name}: ${f}`);
 
     await supabaseAdmin.from('plan_sheets').insert({

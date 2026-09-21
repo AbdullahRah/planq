@@ -381,8 +381,10 @@ export async function extractSheetFromImage(args: {
   fileType: FileType;
   imageDataUrls: string[];
   textHint?: string;
+  /** Why the renderer produced nothing, from lib/parsers/pdf.ts. */
+  renderError?: string;
 }): Promise<ExtractedSheet> {
-  const { sheetName, fileType, imageDataUrls, textHint } = args;
+  const { sheetName, fileType, imageDataUrls, textHint, renderError } = args;
 
   if (imageDataUrls.length === 0) {
     // No page images rendered — try the text-only path before giving up.
@@ -393,7 +395,9 @@ export async function extractSheetFromImage(args: {
         ...rescued.annotations,
         other: [
           ...rescued.annotations.other,
-          'EXTRACT_FALLBACK: pdf renderer produced no page images — used embedded text only',
+          renderError
+            ? `EXTRACT_FALLBACK: pdf renderer produced no page images (${renderError}) — used embedded text only`
+            : 'EXTRACT_FALLBACK: pdf renderer produced no page images — used embedded text only',
         ],
       };
       return rescued;
@@ -405,7 +409,9 @@ export async function extractSheetFromImage(args: {
         ...annotationBuckets,
         other: [
           ...annotationBuckets.other,
-          'EXTRACT_EMPTY: pdf renderer produced no page images',
+          renderError
+            ? `EXTRACT_EMPTY: pdf renderer produced no page images — ${renderError}`
+            : 'EXTRACT_EMPTY: pdf renderer produced no page images',
         ],
       },
     };
