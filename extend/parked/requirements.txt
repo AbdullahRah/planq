@@ -1,4 +1,0 @@
-# Dependencies for the Python Vercel Functions in api/.
-# Pinned to the version this integration was built and tested against; the SDK
-# targets Extend API version 2026-02-09 automatically.
-extend-ai==1.19.0

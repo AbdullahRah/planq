@@ -19,16 +19,6 @@ import { emptyExtractedSheet, type AnalysisResult, type ExtractedSheet, type Fil
 export const runtime = 'nodejs';
 export const maxDuration = 300;
 
-// Which extractor handles raster sheets (pdf/image). Only 'vision' (the
-// OpenRouter path in lib/extract.ts) ships today.
-//
-// The Extend provider is parked: its Python function, requirements.txt and
-// vercel.json now live under extend/parked/ so Vercel no longer builds a Python
-// runtime or runs pip install for a path nothing routes to. The TypeScript
-// mapper in lib/extend-extract.ts is still present and still under test
-// (npm run test:extend); extend/README.md has the steps to restore it.
-const EXTRACT_PROVIDER = (process.env.EXTRACT_PROVIDER ?? 'vision').toLowerCase();
-
 function detectFileType(filename: string): FileType {
   const ext = filename.split('.').pop()?.toLowerCase() ?? '';
   if (ext === 'pdf') return 'pdf';
@@ -67,17 +57,6 @@ export async function POST(req: NextRequest) {
     formData = await req.formData();
   } catch (err) {
     return NextResponse.json({ error: 'invalid form data', detail: String(err) }, { status: 400 });
-  }
-
-  if (EXTRACT_PROVIDER === 'extend') {
-    return NextResponse.json(
-      {
-        error: 'EXTRACT_PROVIDER=extend is not deployable',
-        detail:
-          'The Extend provider is parked under extend/parked/ and its Python function is not built or deployed. Restore it per extend/README.md, or unset EXTRACT_PROVIDER to use the vision path.',
-      },
-      { status: 500 },
-    );
   }
 
   const projectName = (formData.get('project_name') as string) || 'Untitled Project';
@@ -175,9 +154,7 @@ export async function POST(req: NextRequest) {
       s.startsWith('PARSE_ERROR') ||
       s.startsWith('VISION_ERROR') ||
       s.startsWith('EXTRACT_EMPTY') ||
-      s.startsWith('EXTRACT_UNPARSED') ||
-      s.startsWith('EXTEND_ERROR') ||
-      s.startsWith('EXTEND_LOW_CONFIDENCE'),
+      s.startsWith('EXTRACT_UNPARSED'),
     );
     for (const f of flagged) warnings.push(`${file.name}: ${f}`);
 

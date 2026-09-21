@@ -1,9 +1,0 @@
-{
-  "$schema": "https://openapi.vercel.sh/vercel.json",
-  "functions": {
-    "api/extend_extract.py": {
-      "maxDuration": 300,
-      "excludeFiles": "{node_modules/**,.next/**,data/**,public/**,supabase/**,.git/**,**/test_*.py,**/*.test.py}"
-    }
-  }
-}
