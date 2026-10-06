@@ -631,10 +631,10 @@ function StatStrip({
 }
 
 /**
- * What stands behind a finding, in one badge. A deterministic finding is
- * arithmetic against the rules table; a model-authored one carries the verdict
- * of the TypeSafe verification gate (lib/verify.ts). Anything short of
- * "verified" says so plainly rather than looking like settled fact.
+ * What stands behind a finding, in one badge. Today every finding is
+ * deterministic: arithmetic against the rules table, not a model judgement.
+ * PLANQ_SPEC.md §S4 adds an adversarial verifier whose upheld/refuted/uncertain
+ * verdict belongs here, and §8 replaces this card with the five-way status.
  */
 function ProvenanceBadge({ violation: v }: { violation: Violation }) {
   const base =
@@ -642,40 +642,16 @@ function ProvenanceBadge({ violation: v }: { violation: Violation }) {
 
   if (v.source === 'rule_engine') {
     return (
-      <span className={`${base} border-emerald-500/40 text-emerald-500`} title="Measured against the code rules table — arithmetic, not a model judgement">
+      <span
+        className={`${base} border-emerald-500/40 text-emerald-500`}
+        title="Measured against the code rules table — arithmetic, not a model judgement"
+      >
         measured
       </span>
     );
   }
 
-  const ver = v.verification;
-  if (!ver) return null;
-
-  const pct = (n?: number) => (n == null ? '' : ` ${Math.round(n * 100)}%`);
-
-  if (ver.verdict === 'verified') {
-    return (
-      <span
-        className={`${base} border-emerald-500/40 text-emerald-500`}
-        title={`Checked against the text of the cited section by ${ver.model ?? 'the verifier'}${pct(ver.relation_confidence)} confidence`}
-      >
-        verified{pct(ver.relation_confidence)}
-      </span>
-    );
-  }
-
-  const label =
-    ver.verdict === 'unsupported'
-      ? 'citation unverified'
-      : ver.verdict === 'unchecked'
-        ? 'unchecked'
-        : 'needs review';
-
-  return (
-    <span className={`${base} border-amber-500/40 text-amber-500`} title={ver.note ?? label}>
-      {label}
-    </span>
-  );
+  return null;
 }
 
 function ViolationCard({ violation: v }: { violation: Violation }) {
