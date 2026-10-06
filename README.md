@@ -73,9 +73,13 @@ upload
 
 Everything runs from one orchestrator, `lib/review.ts`. The web route
 (`app/api/analyze/route.ts`) and the command line (`npm run review`) both call
-it, so there is exactly one pipeline. Independent model calls run at the same time (both extraction passes, every
-sheet, and up to four verifier checks), which keeps a two-sheet review at about
-1.5 to 3 minutes. Every stage reads and writes JSON that is
+it, so there is exactly one pipeline. Independent model calls run at the same time, up to 16 in flight (both
+extraction passes, eight sheets at once, four verifier checks), which keeps a
+two-sheet review at about 1.5 to 3 minutes and stays well inside the API's
+token rate limit. On a large set the most useful sheets (floor plans, then
+sections and schedules, then elevations) are read first, and the review stops
+starting new sheets in time to return before the function limit, listing any
+sheet it did not read. Every stage reads and writes JSON that is
 validated against a zod schema. If validation fails, the stage retries once with
 the error attached, and then the run stops as `needs_manual_review` instead of
 guessing.
@@ -87,7 +91,9 @@ guessing.
   sized so dimension text is legible).
 - Builds a sheet inventory: number, title, scale, units, size. "Not to scale" is
   flagged. Dual-unit sheets (`10.00 m [32'-9 3/4"]`) are detected so an imperial
-  figure is never read as metric, which would be a 3.28× error.
+  figure is never read as metric, which would be a 3.28× error. Imperial sets
+  are supported: feet and inches (`4'-5 3/4"`), the door tag shorthand `2/8`
+  (2'-8") and areas in ft² are converted in code, never by the model.
 - **Reads the sheet's own legend** (`legend.ts`). Drawings declare their own
   notation: one set writes `N.P.T.` for floor level, another writes `T/O SLAB`
   or `F.F.E.`. Planq learns the notation from each set instead of hardcoding
@@ -428,9 +434,12 @@ Things that have broken deploys before, so they are set up deliberately:
   allows up to 800 seconds; running reviews as background jobs removes the
   limit.
 - **Files read at runtime must be bundled.** `next.config.js` lists them under
-  `outputFileTracingIncludes`: the pdfjs worker, `data/code-store.json`, and
+  `outputFileTracingIncludes`: the pdfjs worker, `data/code-store.json`,
   `@napi-rs/canvas` (which pdfjs needs on a server and loads in a way the
-  bundler cannot see). If a review fails on Vercel but works locally, a missing
+  bundler cannot see), and pdfjs's `standard_fonts` and `cmaps`. Without the
+  fonts, a CAD export that does not embed Arial renders with every dimension
+  blank and the vision pass silently reads nothing; `renderSheet` now refuses
+  to run if they are missing. If a review fails on Vercel but works locally, a missing
   file here is the first thing to check.
 - **The clause store is committed.** The rest of `data/` is gitignored, but
   `data/code-store.json` is tracked because there is no code PDF on Vercel to
