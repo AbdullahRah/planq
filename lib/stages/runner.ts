@@ -20,6 +20,32 @@ export class BudgetExceededError extends Error {
   }
 }
 
+/**
+ * At most this many model calls in flight across the whole process. A 26-sheet
+ * set fired 52 vision calls at once, went past the organization's 500 000 input
+ * tokens per minute, and nine sheets came back as 429s. A vision call is about
+ * 17 000 input tokens and takes one to two minutes, so 16 at once is about
+ * 270 000 tokens a minute: inside the limit, with headroom for a second review
+ * running at the same time.
+ */
+const MAX_CONCURRENT_CALLS = Number(process.env.PLANQ_MAX_CONCURRENT_CALLS) || 16;
+let inFlight = 0;
+const waiting: Array<() => void> = [];
+
+async function acquireSlot(): Promise<void> {
+  if (inFlight < MAX_CONCURRENT_CALLS) {
+    inFlight += 1;
+    return;
+  }
+  await new Promise<void>((resolve) => waiting.push(resolve));
+}
+
+function releaseSlot(): void {
+  const next = waiting.shift();
+  if (next) next(); // hand the slot straight over
+  else inFlight -= 1;
+}
+
 export class StageFailedError extends Error {
   constructor(stage: string, detail: string) {
     super(`[${stage}] needs_manual_review: ${detail}`);
@@ -125,9 +151,15 @@ export async function runStage<T extends z.ZodTypeAny>(
           : { type: 'adaptive' };
     }
 
-    const res = await (anthropic as unknown as {
-      messages: { create(b: unknown): Promise<Record<string, unknown>> };
-    }).messages.create(body);
+    await acquireSlot();
+    let res: Record<string, unknown>;
+    try {
+      res = await (anthropic as unknown as {
+        messages: { create(b: unknown): Promise<Record<string, unknown>> };
+      }).messages.create(body);
+    } finally {
+      releaseSlot();
+    }
 
     const usage = (res.usage ?? {}) as {
       input_tokens?: number;

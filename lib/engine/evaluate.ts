@@ -26,7 +26,7 @@ import type {
   Rule,
 } from '../schemas';
 import { mayDisplayFail } from '../schemas';
-import { convert, UnitMismatchError } from './units';
+import { convert, parseDoorTag, parseImperial, UnitMismatchError } from './units';
 import type { SpaceClass } from './spaces';
 
 export interface EvaluateInput {
@@ -47,6 +47,19 @@ export interface EvaluateOutput {
 }
 
 function factNumber(f: Fact, toUnit: string): number | null {
+  if (typeof f.value === 'string') {
+    // Imperial is parsed here, in code, so the model never converts (§G4).
+    const mm =
+      parseImperial(f.value) ??
+      (f.kind === 'door_width_mm' ? parseDoorTag(f.value) : null);
+    if (mm == null) return null;
+    try {
+      return convert(mm, 'mm', toUnit);
+    } catch (err) {
+      if (err instanceof UnitMismatchError) return null;
+      throw err;
+    }
+  }
   if (typeof f.value !== 'number') return null;
   // A fact with no unit is only usable when the rule's unit is dimensionless.
   if (!f.unit) return toUnit === 'count' || toUnit === 'ratio' ? f.value : null;
@@ -149,6 +162,9 @@ function gate(status: FindingStatus, rule: Rule): FindingStatus {
   if (status !== 'fail') return status;
   return mayDisplayFail(rule) ? 'fail' : 'needs_confirmation';
 }
+
+/** Readings this close are taken to be the same element (see consistency). */
+const CONSISTENCY_SPREAD = 2;
 
 let seq = 0;
 function nextId(): string {
@@ -258,45 +274,78 @@ export function evaluate(input: EvaluateInput): EvaluateOutput {
       // Only numeric readings can be compared. A sheet whose reading is not a
       // number is left out rather than coerced: NaN never equals anything, so
       // it used to turn an unreadable value into a false drawing conflict.
-      const values = [...bySheet.entries()].flatMap(([sheet, fs]) => {
-        const f = fs.find((x) => typeof x.value === 'number' && Number.isFinite(x.value));
-        return f ? [{ sheet, value: f.value as number, fact: f }] : [];
-      });
+      const readings = relevant.flatMap((f) =>
+        typeof f.value === 'number' && Number.isFinite(f.value)
+          ? [{ sheet: f.provenance === 'drawing_text' ? f.sheet : (f.container ?? 'ifc'), value: f.value, fact: f }]
+          : [],
+      );
 
-      if (values.length < 2) {
+      // A set can have more than one stair. A drafting slip puts the same
+      // flight one or two risers apart on two sheets (Chesnut: 16 on the plan,
+      // 17 on the section); a deck stair of 8 beside a main stair of 15 is a
+      // different flight, and reporting that as a conflict was wrong. So
+      // readings within CONSISTENCY_SPREAD of each other are treated as one
+      // element, and only disagreement inside a group is a conflict.
+      const groups: Array<typeof readings> = [];
+      for (const r of [...readings].sort((x, y) => x.value - y.value)) {
+        const last = groups[groups.length - 1];
+        if (last && r.value - last[last.length - 1].value <= CONSISTENCY_SPREAD) last.push(r);
+        else groups.push([r]);
+      }
+
+      if (groups.length === 0) {
         findings.push({
           ...base,
           id: nextId(),
           status: 'cant_determine',
-          summary: `${rule.title}: a numeric reading appears on ${values.length} sheet(s), so it cannot be cross-checked.`,
+          summary: `${rule.title}: no numeric reading could be cross-checked.`,
           fact_ids: relevant.map((f) => f.id),
           computed: { sheets: [...bySheet.keys()].join(', ') },
           drawing_reference: drawingRef(relevant),
         });
         continue;
       }
-      const distinct = new Set(values.map((v) => v.value));
 
-      if (distinct.size > 1) {
-        findings.push({
-          ...base,
-          id: nextId(),
-          status: 'drawing_conflict',
-          summary: `${rule.title}: ${values.map((v) => `sheet ${v.sheet} shows ${v.value}`).join(', ')}. The sheets disagree.`,
-          fact_ids: values.map((v) => v.fact.id),
-          computed: Object.fromEntries(values.map((v) => [`sheet_${v.sheet}`, v.value])),
-          drawing_reference: values.map((v) => `Sheet ${v.sheet}`).join(', '),
-        });
-      } else {
-        findings.push({
-          ...base,
-          id: nextId(),
-          status: 'pass',
-          summary: `${rule.title}: every sheet shows ${[...distinct][0]}.`,
-          fact_ids: values.map((v) => v.fact.id),
-          computed: { agreed: [...distinct][0] },
-          drawing_reference: values.map((v) => `Sheet ${v.sheet}`).join(', '),
-        });
+      for (const g of groups) {
+        const sheets = [...new Set(g.map((r) => r.sheet))];
+        const perSheet = sheets.map((sh) => ({
+          sheet: sh,
+          values: [...new Set(g.filter((r) => r.sheet === sh).map((r) => r.value))],
+        }));
+        const distinct = [...new Set(g.map((r) => r.value))];
+        const label = g.length > 1 || groups.length > 1 ? `${g[0].fact.subject || 'element'}: ` : '';
+
+        if (sheets.length < 2) {
+          findings.push({
+            ...base,
+            id: nextId(),
+            status: 'cant_determine',
+            summary: `${rule.title}: ${label}${distinct.join(' or ')} appears only on sheet ${sheets[0]}, so it cannot be cross-checked.`,
+            fact_ids: g.map((r) => r.fact.id),
+            computed: { sheets: sheets[0], value: distinct.join(', ') },
+            drawing_reference: drawingRef(g.map((r) => r.fact)),
+          });
+        } else if (distinct.length > 1) {
+          findings.push({
+            ...base,
+            id: nextId(),
+            status: 'drawing_conflict',
+            summary: `${rule.title}: ${perSheet.map((p) => `sheet ${p.sheet} shows ${p.values.join(' and ')}`).join(', ')}. The sheets disagree.`,
+            fact_ids: g.map((r) => r.fact.id),
+            computed: Object.fromEntries(perSheet.map((p) => [`sheet_${p.sheet}`, p.values.join(', ')])),
+            drawing_reference: sheets.map((sh) => `Sheet ${sh}`).join(', '),
+          });
+        } else {
+          findings.push({
+            ...base,
+            id: nextId(),
+            status: 'pass',
+            summary: `${rule.title}: sheets ${sheets.join(', ')} all show ${distinct[0]}.`,
+            fact_ids: g.map((r) => r.fact.id),
+            computed: { agreed: distinct[0] },
+            drawing_reference: sheets.map((sh) => `Sheet ${sh}`).join(', '),
+          });
+        }
       }
       continue;
     }

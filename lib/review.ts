@@ -24,6 +24,7 @@ import { evaluate, attachClauseQuotes, resetFindingIds } from './engine/evaluate
 import { PART9_RULES } from './rules/part9';
 import { loadCodeStore, lookupClauses, quoteIsGrounded } from './code-store';
 import { RUN_BUDGET_USD } from './claude';
+import { downgrade, VERIFIABLE_STATUSES } from './schemas';
 import type {
   Applicability,
   ClauseRecord,
@@ -45,6 +46,13 @@ export interface ReviewOptions {
   useVision?: boolean;
   useVerify?: boolean;
   budgetUsd?: number;
+  /**
+   * Wall-clock time (epoch ms) by which the review must return. A serverless
+   * function is killed at its limit and the user gets a 504 with nothing; with
+   * a deadline, sheets that could not be started in time are listed as unread
+   * and the findings from the rest still come back.
+   */
+  deadline?: number;
   /** Progress for a UI or a terminal. */
   onProgress?: (stage: string, detail: string) => void;
 }
@@ -93,6 +101,26 @@ function countStatuses(findings: Finding[]): Record<FindingStatus, number> {
   for (const f of findings) counts[f.status] += 1;
   return counts;
 }
+
+/**
+ * Which sheets to read first when a set may not finish. Floor plans, sections
+ * and schedules carry most of what the rules need; an index or a cover sheet
+ * carries none of it. Ties keep the set's own order.
+ */
+function sheetPriority(s: SheetInventory): number {
+  const t = s.title.toUpperCase();
+  if (/FLOOR PLAN|MAIN FLOOR|UPPER FLOOR|SECOND FLOOR|BASEMENT|GROUND FLOOR|LOWER FLOOR/.test(t)) return 0;
+  if (/SECTION|SCHEDULE|STAIR/.test(t)) return 1;
+  if (/ELEVATION|FOUNDATION|DECK/.test(t)) return 2;
+  if (/INDEX|COVER|TITLE|LEGEND|KEY PLAN/.test(t)) return 4;
+  return 3;
+}
+
+/** Leave this long after S2 for S3, S4 and saving. A sheet takes about 90 s. */
+const S2_START_CUTOFF_MS = 150_000;
+const S4_START_CUTOFF_MS = 70_000;
+/** Two vision calls per sheet, so this fills the runner's 16 call slots. */
+const SHEET_CONCURRENCY = 8;
 
 function summarizeSheets(sheets: SheetInventory[]): SheetSummary[] {
   return sheets.map((s) => ({
@@ -245,8 +273,22 @@ export async function runReview(opts: ReviewOptions): Promise<ReviewResult> {
     // Sheets are read at the same time. One after another, a two-sheet set
     // spent over four minutes here and Vercel cut the function off at 300 s.
     // Results are merged in sheet order so fact ids and warnings stay stable.
-    const results = await Promise.all(
-      intakeResult.sheets.map(async (sheet) => {
+    // A few sheets at a time, most useful first, and none started once there is
+    // no longer time to finish it. Firing every sheet at once took a 26-sheet
+    // set past the API's token rate limit; finishing none of them took it past
+    // the function's time limit.
+    type SheetResult =
+      | { ok: true; sheet: SheetInventory; v: Awaited<ReturnType<typeof extractSheetByVision>> }
+      | { ok: false; sheet: SheetInventory; err: unknown }
+      | { ok: false; sheet: SheetInventory; skipped: true };
+    const queue = [...intakeResult.sheets].sort((a, b) => sheetPriority(a) - sheetPriority(b));
+    const bySheet = new Map<string, SheetResult>();
+    const worker = async () => {
+      for (let sheet = queue.shift(); sheet; sheet = queue.shift()) {
+        if (opts.deadline && Date.now() > opts.deadline - S2_START_CUTOFF_MS) {
+          bySheet.set(sheet.number, { ok: false, sheet, skipped: true });
+          continue;
+        }
         try {
           const rendered = await render(sheet);
           const v = await extractSheetByVision(
@@ -261,18 +303,28 @@ export async function runReview(opts: ReviewOptions): Promise<ReviewResult> {
             'S2',
             `sheet ${sheet.number}: ${v.facts.length} value(s), ${v.facts.filter((f) => f.stable).length} read the same way twice`,
           );
-          return { ok: true as const, v };
+          bySheet.set(sheet.number, { ok: true, sheet, v });
         } catch (err) {
-          return { ok: false as const, sheet, err };
+          bySheet.set(sheet.number, { ok: false, sheet, err });
         }
-      }),
-    );
+      }
+    };
+    await Promise.all(Array.from({ length: SHEET_CONCURRENCY }, worker));
+    // Merged in the set's own order so fact ids and warnings stay stable.
+    const results = intakeResult.sheets.map((s) => bySheet.get(s.number)!);
+    const unread = results.filter((r) => !r.ok && 'skipped' in r).map((r) => r.sheet.number);
+    if (unread.length > 0) {
+      warnings.push(
+        `Sheet${unread.length === 1 ? '' : 's'} ${unread.join(', ')} ${unread.length === 1 ? 'was' : 'were'} not read: the review ran out of time before ${unread.length === 1 ? 'it' : 'they'} could be started, so only ${unread.length === 1 ? 'its' : 'their'} text layer was used. Findings on what ${unread.length === 1 ? 'that sheet shows' : 'those sheets show'} may be missing.`,
+      );
+    }
     for (const r of results) {
       if (r.ok) {
         facts.push(...r.v.facts);
         negative.push(...r.v.negative);
         continue;
       }
+      if ('skipped' in r) continue;
       if (r.err instanceof BudgetExceededError) throw r.err;
       warnings.push(
         `sheet ${r.sheet.number}: the vision pass failed, so only values in the text layer were read. ${
@@ -318,7 +370,23 @@ export async function runReview(opts: ReviewOptions): Promise<ReviewResult> {
 
   // ---- S4 ---------------------------------------------------------------
   let verification = { checked: 0, downgraded: 0, skipped: 0 };
-  if (useVerify) {
+  if (useVerify && opts.deadline && Date.now() > opts.deadline - S4_START_CUTOFF_MS) {
+    // §G7: a finding nobody tried to refute is not upheld, so it is downgraded
+    // rather than shown at full strength.
+    const n = findings.filter((f) => VERIFIABLE_STATUSES.includes(f.status)).length;
+    findings = findings.map((f) =>
+      VERIFIABLE_STATUSES.includes(f.status)
+        ? {
+            ...f,
+            status: downgrade(f.status),
+            verifier: 'uncertain' as const,
+            verifier_reason: 'not verified: the review ran out of time before the independent check could run',
+          }
+        : f,
+    );
+    verification = { checked: 0, downgraded: n, skipped: n };
+    if (n > 0) warnings.push(`${n} finding(s) could not be independently checked in time and were downgraded one level.`);
+  } else if (useVerify) {
     progress('S4', 'trying to refute each finding');
     const factById = new Map(facts.map((f) => [f.id, f]));
     const res = await verifyFindings(

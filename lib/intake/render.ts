@@ -89,6 +89,26 @@ export async function renderImageSheet(
   return { sheet: sheetNumber, thumbnail, tiles, scale: 1 };
 }
 
+/**
+ * The renderer reads pdfjs's standard fonts from node_modules by path. If they
+ * are missing, as they were on Vercel until next.config.js traced them, text
+ * in fonts the PDF does not embed is drawn as nothing and every sheet reaches
+ * the vision pass with its numbers gone. Fail loudly instead.
+ */
+let fontDataChecked = false;
+function assertFontDataPresent(): void {
+  if (fontDataChecked) return;
+  const { existsSync } = require('node:fs') as typeof import('node:fs');
+  const { resolve } = require('node:path') as typeof import('node:path');
+  const probe = resolve(process.cwd(), 'node_modules/pdfjs-dist/standard_fonts/LiberationSans-Regular.ttf');
+  if (!existsSync(probe)) {
+    throw new Error(
+      `PDF font data is missing (${probe}), so sheet text would render blank. Trace node_modules/pdfjs-dist/standard_fonts into the function.`,
+    );
+  }
+  fontDataChecked = true;
+}
+
 export async function renderSheet(
   pdfPath: string,
   pdfPage: number,
@@ -104,6 +124,7 @@ export async function renderSheet(
   // pdf-to-png-converter rather than a raw pdfjs canvas render: pdfjs 5.x calls
   // ctx.fill(path, "evenodd"), which @napi-rs/canvas rejects outright, and this
   // package already carries a working canvas binding that this repo ships with.
+  assertFontDataPresent();
   const buf = readFileSync(pdfPath);
   const [rendered] = await pdfToPng(buf, {
     pagesToProcess: [pdfPage],

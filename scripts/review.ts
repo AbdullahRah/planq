@@ -5,6 +5,8 @@
 //   npm run review -- --no-vision <pdf>      text layer only, no model vision
 //   npm run review -- --no-verify <pdf>      skip S4, for a cheaper dry run
 //   npm run review -- --out report.md <pdf>  write the S5 report
+//   npm run review -- --deadline 280 <pdf>   stop starting work as the API route would
+//   npm run review -- --budget 12 <pdf>      dollar ceiling, for a full permit set
 //
 // The pipeline itself is lib/review.ts, shared with the API route so the two
 // cannot drift. This file is presentation only.
@@ -63,6 +65,8 @@ async function main() {
     name: path.basename(file),
     useVision: !flag('no-vision'),
     useVerify: !flag('no-verify'),
+    ...(opt('deadline') ? { deadline: Date.now() + Number(opt('deadline')) * 1000 } : {}),
+    ...(opt('budget') ? { budgetUsd: Number(opt('budget')) } : {}),
     onProgress: (stage, detail) => console.log(`${stage}  ${detail}`),
   });
 

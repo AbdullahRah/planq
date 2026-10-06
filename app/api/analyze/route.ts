@@ -21,6 +21,7 @@ export const maxDuration = 300;
  * rule engine replaced that model.
  */
 export async function POST(req: NextRequest) {
+  const startedAt = Date.now();
   let formData: FormData;
   try {
     formData = await req.formData();
@@ -88,6 +89,9 @@ export async function POST(req: NextRequest) {
       kind,
       name: file.name,
       budgetUsd: RUN_BUDGET_USD.permitSet,
+      // Finish inside maxDuration with room to save: a review that returns
+      // with some sheets unread beats a 504 that returns nothing.
+      deadline: startedAt + (maxDuration - 20) * 1000,
       onProgress: (stage, detail) => {
         // eslint-disable-next-line no-console
         console.log(`[analyze] ${stage}: ${detail}`);

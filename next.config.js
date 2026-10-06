@@ -28,6 +28,12 @@ const nextConfig = {
       '/api/analyze': [
         './node_modules/pdfjs-dist/legacy/build/pdf.worker.mjs',
         './node_modules/@napi-rs/**',
+        // Font data and character maps the PDF renderer reads by path. Without
+        // them a CAD export that does not embed Arial or Helvetica rasterizes
+        // with every dimension and tag missing, and the vision pass reads
+        // nothing. That failed silently: zero values, no error.
+        './node_modules/pdfjs-dist/standard_fonts/**',
+        './node_modules/pdfjs-dist/cmaps/**',
         './data/code-store.json',
       ],
     },
