@@ -1,50 +1,26 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { promises as fs } from 'fs';
+import path from 'path';
+import os from 'os';
+import { randomUUID } from 'crypto';
 import { supabaseAdmin } from '@/lib/supabase';
-import { parsePdf } from '@/lib/parsers/pdf';
-import { parseImage } from '@/lib/parsers/image';
-import { parseDxf, DwgUnsupportedError } from '@/lib/parsers/dxf';
-import { extractSheetFromImage, mergeExtraction, delay } from '@/lib/extract';
-import { dedupeViolations, ruleEnginePass, sheetHasUsableData } from '@/lib/analyze';
-import { detectBuildingPart } from '@/lib/rule-engine/occupancy';
-import { emptyAnnotations, isDiagnosticMarker } from '@/lib/annotations';
-import { emptyExtractedSheet, type AnalysisResult, type ExtractedSheet, type FileType, type Violation } from '@/lib/types';
+import { detectInputKind, runReview } from '@/lib/review';
+import { BudgetExceededError } from '@/lib/stages/runner';
+import { RUN_BUDGET_USD } from '@/lib/claude';
 
 export const runtime = 'nodejs';
-export const maxDuration = 300;
+export const maxDuration = 800;
 
-function detectFileType(filename: string): FileType {
-  const ext = filename.split('.').pop()?.toLowerCase() ?? '';
-  if (ext === 'pdf') return 'pdf';
-  if (ext === 'dxf') return 'dxf';
-  if (ext === 'dwg') return 'dwg';
-  if (['png', 'jpg', 'jpeg', 'tif', 'tiff', 'webp'].includes(ext)) return 'image';
-  return 'image';
-}
-
-function summarize(
-  violations: Violation[],
-  sheets: ExtractedSheet[],
-  planId: string,
-  warnings: string[],
-): AnalysisResult {
-  const summary = { critical: 0, major: 0, minor: 0, compliance: 0, consistency: 0 };
-  for (const v of violations) {
-    summary[v.severity] += 1;
-    summary[v.type] += 1;
-  }
-  return {
-    plan_id: planId,
-    violations,
-    sheets,
-    sheets_analyzed: sheets.length,
-    summary,
-    warnings: warnings.length > 0 ? warnings : undefined,
-  };
-}
-
+/**
+ * Run a review (PLANQ_SPEC.md §4).
+ *
+ * The whole pipeline lives in lib/review.ts so this route and the CLI cannot
+ * drift. The previous version of this file had its own extraction path built on
+ * OpenRouter and the retired ExtractedSheet model, which is why it kept
+ * producing three-level severity violations months after the clause store and
+ * rule engine replaced that model.
+ */
 export async function POST(req: NextRequest) {
-  // eslint-disable-next-line no-console
-  console.log('[analyze] request received');
   let formData: FormData;
   try {
     formData = await req.formData();
@@ -54,9 +30,26 @@ export async function POST(req: NextRequest) {
 
   const projectName = (formData.get('project_name') as string) || 'Untitled Project';
   const files = formData.getAll('files').filter((f): f is File => f instanceof File);
-
   if (files.length === 0) {
     return NextResponse.json({ error: 'no files uploaded' }, { status: 400 });
+  }
+
+  // One review covers one drawing set, and a set is one file today: §S0's
+  // sheet inventory comes from inside the document. Multiple uploads are
+  // reviewed as separate sets rather than silently merged, which would make a
+  // cross-sheet conflict between two unrelated buildings look real.
+  const file = files[0];
+  const extraFiles = files.slice(1).map((f) => f.name);
+
+  const kind = detectInputKind(file.name);
+  if (!kind) {
+    return NextResponse.json(
+      {
+        error: 'unsupported file type',
+        detail: `${file.name} is not a PDF or a raster image. DWG and IFC are not supported yet.`,
+      },
+      { status: 400 },
+    );
   }
 
   const { data: planRow, error: planErr } = await supabaseAdmin
@@ -66,178 +59,127 @@ export async function POST(req: NextRequest) {
     .single();
 
   if (planErr || !planRow) {
-    // eslint-disable-next-line no-console
-    console.error('[analyze] failed to create plan row', planErr);
     return NextResponse.json(
-      {
-        error: 'failed to create plan',
-        detail: planErr?.message ?? 'unknown',
-        code: planErr?.code,
-        hint: planErr?.hint,
-      },
+      { error: 'failed to create plan', detail: planErr?.message ?? 'unknown' },
       { status: 500 },
     );
   }
-
   const planId = planRow.id as string;
-  const sheets: ExtractedSheet[] = [];
-  const warnings: string[] = [];
-  // eslint-disable-next-line no-console
-  console.log(`[analyze] plan ${planId} processing ${files.length} file(s)`);
 
-  for (let idx = 0; idx < files.length; idx++) {
-    const file = files[idx];
-    const fileType = detectFileType(file.name);
+  const buffer = Buffer.from(await file.arrayBuffer());
+  const storagePath = `${planId}/${Date.now()}-${file.name}`;
+  const upload = await supabaseAdmin.storage.from('plans').upload(storagePath, buffer, {
+    contentType: file.type || 'application/octet-stream',
+    upsert: false,
+  });
+  if (upload.error) {
     // eslint-disable-next-line no-console
-    console.log(`[analyze] [${idx + 1}/${files.length}] ${file.name} (${fileType})`);
-
-    const arrayBuffer = await file.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-    const storagePath = `${planId}/${Date.now()}-${file.name}`;
-
-    const upload = await supabaseAdmin.storage.from('plans').upload(storagePath, buffer, {
-      contentType: file.type || 'application/octet-stream',
-      upsert: false,
-    });
-    if (upload.error) {
-      // eslint-disable-next-line no-console
-      console.error('[analyze] storage upload error', upload.error);
-    }
-
-    let extracted: ExtractedSheet;
-
-    try {
-      if (fileType === 'pdf') {
-        const pdf = await parsePdf(buffer);
-        extracted = await extractSheetFromImage({
-          sheetName: file.name,
-          fileType,
-          imageDataUrls: pdf.pageImages,
-          textHint: pdf.text,
-          renderError: pdf.renderError,
-        });
-      } else if (fileType === 'image') {
-        const img = await parseImage(buffer, file.name);
-        extracted = await extractSheetFromImage({
-          sheetName: file.name,
-          fileType,
-          imageDataUrls: [img.dataUrl],
-        });
-      } else if (fileType === 'dxf') {
-        const dxf = parseDxf(buffer);
-        extracted = mergeExtraction(file.name, fileType, {
-          dimensions: dxf.dimensions,
-          annotations: dxf.annotations,
-        });
-      } else {
-        throw new DwgUnsupportedError();
-      }
-    } catch (err) {
-      // eslint-disable-next-line no-console
-      console.error(`[analyze] parse failed for ${file.name}`, err);
-      const message = err instanceof Error ? err.message : 'parse failed';
-      extracted = {
-        ...emptyExtractedSheet(file.name, fileType),
-        annotations: { ...emptyAnnotations(), other: [`PARSE_ERROR: ${message}`] },
-      };
-    }
-
-    sheets.push(extracted);
-
-    const flagged = extracted.annotations.other.filter(isDiagnosticMarker);
-    for (const f of flagged) warnings.push(`${file.name}: ${f}`);
-
-    await supabaseAdmin.from('plan_sheets').insert({
-      plan_id: planId,
-      sheet_name: file.name,
-      file_type: fileType,
-      storage_path: storagePath,
-      extracted_data: extracted,
-    });
-
-    if (idx < files.length - 1 && (fileType === 'pdf' || fileType === 'image')) {
-      await delay(1000);
-    }
+    console.error('[analyze] storage upload failed', upload.error);
   }
 
-  // eslint-disable-next-line no-console
-  console.log('[analyze] running deterministic rule engine');
-  const allViolations: Violation[] = [];
-  for (const sheet of sheets) {
-    if (!sheetHasUsableData(sheet)) {
-      warnings.push(`${sheet.sheet_name}: extraction empty — skipping compliance pass`);
-      continue;
-    }
+  // The pipeline reads from disk: pdfjs and sharp both want a file, and a
+  // 25-sheet permit set should not be held in memory three times over.
+  const tmp = path.join(os.tmpdir(), `planq-${randomUUID()}${path.extname(file.name)}`);
+  await fs.writeFile(tmp, buffer);
 
-    // Which NBC Part governs this sheet, read off the sheet's own stated
-    // occupancy. Undefined when the drawings do not say; PLANQ_SPEC.md §S1
-    // replaces this with a Haiku applicability stage that stops the run rather
-    // than guessing.
-    const buildingPart = detectBuildingPart(sheet.occupancy_type, sheet.building_type);
-    if (!buildingPart) {
-      warnings.push(
-        `${sheet.sheet_name}: occupancy not stated on the sheet — Part 9 vs Part 3 unresolved, part-specific checks skipped`,
+  try {
+    const result = await runReview({
+      filePath: tmp,
+      kind,
+      name: file.name,
+      budgetUsd: RUN_BUDGET_USD.permitSet,
+      onProgress: (stage, detail) => {
+        // eslint-disable-next-line no-console
+        console.log(`[analyze] ${stage}: ${detail}`);
+      },
+    });
+
+    if (extraFiles.length > 0) {
+      result.warnings.push(
+        `Only ${file.name} was reviewed. ${extraFiles.join(', ')} ${
+          extraFiles.length === 1 ? 'was' : 'were'
+        } not, because a review covers one drawing set and merging separate files would make a conflict between unrelated buildings look real.`,
       );
     }
 
-    try {
-      const ruleOut = await ruleEnginePass(sheet, { buildingPart });
-      allViolations.push(...ruleOut.violations);
-      // Say what the guardrails threw away, so "no violations" is never
-      // indistinguishable from "nothing was measurable".
-      for (const note of ruleOut.skipped.slice(0, 8)) {
-        warnings.push(
-          `${sheet.sheet_name}: ignored ${note.attribute.replace(/_mm$/, '')} "${note.raw}" on ${
-            note.element
-          } — ${
-            note.reason === 'ambiguous-unit'
-              ? 'no unit given and the value is plausible in more than one unit'
-              : 'not a physically plausible value for that element'
-          }`,
+    await supabaseAdmin.from('plan_sheets').insert(
+      result.sheets.map((s) => ({
+        plan_id: planId,
+        sheet_name: `${s.number} ${s.title}`,
+        file_type: kind,
+        storage_path: storagePath,
+        extracted_data: {
+          sheet: s,
+          facts: result.facts.filter(
+            (f) => f.provenance === 'drawing_text' && f.sheet === s.number,
+          ),
+        },
+      })),
+    );
+
+    if (result.findings.length > 0) {
+      const { error: fErr } = await supabaseAdmin.from('findings').insert(
+        result.findings.map((f) => ({
+          plan_id: planId,
+          run_id: result.run_id,
+          finding_id: f.id,
+          rule_id: f.rule_id,
+          status: f.status,
+          summary: f.summary,
+          clause_ids: f.clause_ids,
+          clause_quotes: f.clause_quotes,
+          fact_ids: f.fact_ids,
+          computed: f.computed,
+          required_action: f.required_action,
+          verifier: f.verifier,
+          verifier_reason: f.verifier_reason ?? null,
+          reviewer_state: f.reviewer_state,
+          drawing_reference: f.drawing_reference ?? null,
+        })),
+      );
+      if (fErr) {
+        // eslint-disable-next-line no-console
+        console.error('[analyze] findings insert failed', fErr);
+        result.warnings.push(
+          'Findings could not be saved, so this review will not appear in the reviewer queue.',
         );
       }
-      if (ruleOut.skipped.length > 8) {
-        warnings.push(
-          `${sheet.sheet_name}: ${ruleOut.skipped.length - 8} further unusable measurement(s) ignored`,
-        );
-      }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      warnings.push(`rule engine failed for ${sheet.sheet_name}: ${msg}`);
-      // eslint-disable-next-line no-console
-      console.error('[analyze] rule engine error', err);
     }
 
-    await delay(500);
-  }
+    await supabaseAdmin
+      .from('plans')
+      .update({
+        status: result.status,
+        run_id: result.run_id,
+        cost_usd: result.audit.total_cost_usd,
+        code_store_hash: result.code_store_hash,
+      })
+      .eq('id', planId);
 
-  // One physical element measured on several pages must not read as several
-  // violations.
-  const finalViolations = dedupeViolations(allViolations);
+    return NextResponse.json({ plan_id: planId, ...result });
+  } catch (err) {
+    await supabaseAdmin
+      .from('plans')
+      .update({ status: 'needs_manual_review' })
+      .eq('id', planId);
 
-  if (finalViolations.length > 0) {
-    const rows = finalViolations.map((v) => ({
-      plan_id: planId,
-      type: v.type,
-      severity: v.severity,
-      description: v.description,
-      section_id: v.section_id ?? null,
-      code_citation: v.code_citation ?? null,
-      affected_sheets: v.affected_sheets ?? null,
-      location_hint: v.location_hint ?? null,
-      source: v.source ?? null,
-    }));
-    const { error: vErr } = await supabaseAdmin.from('violations').insert(rows);
-    if (vErr) {
-      // eslint-disable-next-line no-console
-      console.error('[analyze] violations insert failed', vErr);
+    if (err instanceof BudgetExceededError) {
+      return NextResponse.json(
+        { error: 'run budget exceeded', detail: err.message, plan_id: planId },
+        { status: 402 },
+      );
     }
+    // eslint-disable-next-line no-console
+    console.error('[analyze] review failed', err);
+    return NextResponse.json(
+      {
+        error: 'review failed',
+        detail: err instanceof Error ? err.message : String(err),
+        plan_id: planId,
+      },
+      { status: 500 },
+    );
+  } finally {
+    await fs.rm(tmp, { force: true });
   }
-
-  await supabaseAdmin.from('plans').update({ status: 'complete' }).eq('id', planId);
-
-  const result = summarize(finalViolations, sheets, planId, warnings);
-  // eslint-disable-next-line no-console
-  console.log(`[analyze] done — ${finalViolations.length} violation(s)`);
-  return NextResponse.json(result);
 }
