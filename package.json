@@ -10,7 +10,11 @@
     "ingest-rules": "ts-node --project tsconfig.scripts.json scripts/ingest-rules.ts",
     "rules:diff": "ts-node --project tsconfig.scripts.json scripts/rule-diff.ts",
     "test:rules": "ts-node --project tsconfig.scripts.json scripts/rule-engine-test.ts",
-    "test": "npm run test:rules"
+    "test": "npm run test:rules && npm run test:engine && npm run verify:rules",
+    "code:build": "ts-node --project tsconfig.scripts.json scripts/build-code-store.ts",
+    "clause": "ts-node --project tsconfig.scripts.json scripts/clause.ts",
+    "verify:rules": "ts-node --project tsconfig.scripts.json scripts/verify-rules.ts",
+    "test:engine": "ts-node --project tsconfig.scripts.json scripts/engine-test.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.70.1",
@@ -25,7 +29,8 @@
     "pdf-to-png-converter": "^4.0.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "sharp": "^0.33.5"
+    "sharp": "^0.33.5",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/node": "^20",

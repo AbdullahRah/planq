@@ -9,10 +9,16 @@
 
 import Anthropic from '@anthropic-ai/sdk';
 
+// An API key that is not scoped to a single workspace must name one per
+// request, or every call fails with a 400 telling you to add this header. A
+// workspace-scoped key needs nothing here.
+const workspaceId = process.env.ANTHROPIC_WORKSPACE_ID?.trim();
+
 export const anthropic = new Anthropic({
   // Resolves ANTHROPIC_API_KEY, then ANTHROPIC_AUTH_TOKEN, then an
   // `ant auth login` profile. Never hardcode a key.
   maxRetries: 2,
+  ...(workspaceId ? { defaultHeaders: { 'anthropic-workspace-id': workspaceId } } : {}),
 });
 
 /**
