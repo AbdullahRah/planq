@@ -5,6 +5,11 @@ dist-scripts/
 .env
 .env.local
 .env.*.local
+# Anything derived from an env file is still an env file. A plain `.env.local`
+# rule does not match `.env.local.bak-1234`, which is exactly the file a careful
+# edit leaves behind.
+.env*
+!.env.local.example
 *.tsbuildinfo
 next-env.d.ts
 .DS_Store

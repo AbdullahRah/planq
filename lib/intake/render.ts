@@ -35,6 +35,60 @@ export interface RenderedSheet {
 const TILE_TARGET_PX = 2000;
 const OVERLAP_FRACTION = 0.12;
 
+/**
+ * Tile a raster sheet that is already an image, with no PDF to rasterize.
+ * Same overlap and tile budget as renderSheet so the vision prompt is identical.
+ */
+export async function renderImageSheet(
+  filePath: string,
+  sheetNumber: string,
+  opts: { rows?: number; cols?: number } = {},
+): Promise<RenderedSheet> {
+  const { readFileSync } = await import('node:fs');
+  const rows = opts.rows ?? 2;
+  const cols = opts.cols ?? 2;
+
+  const full = await sharp(readFileSync(filePath)).png().toBuffer();
+  const meta = await sharp(full).metadata();
+  const pxW = meta.width ?? 0;
+  const pxH = meta.height ?? 0;
+  if (!pxW || !pxH) throw new Error(`image ${filePath} has no dimensions`);
+
+  const thumbnail = await sharp(full)
+    .resize({ width: 1400, withoutEnlargement: true })
+    .png({ compressionLevel: 9 })
+    .toBuffer();
+
+  const tileW = Math.floor(pxW / cols);
+  const tileH = Math.floor(pxH / rows);
+  const padX = Math.floor(tileW * OVERLAP_FRACTION);
+  const padY = Math.floor(tileH * OVERLAP_FRACTION);
+
+  const tiles: Tile[] = [];
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const left = Math.max(0, c * tileW - padX);
+      const top = Math.max(0, r * tileH - padY);
+      const width = Math.min(pxW - left, tileW + padX * 2);
+      const height = Math.min(pxH - top, tileH + padY * 2);
+      const png = await sharp(full)
+        .extract({ left, top, width, height })
+        .png({ compressionLevel: 9 })
+        .toBuffer();
+      tiles.push({
+        id: `${sheetNumber}-r${r}c${c}`,
+        row: r,
+        col: c,
+        png,
+        region: { x: left, y: pxH - top - height, width, height },
+      });
+    }
+  }
+
+  // Scale 1: image pixels are the sheet's own coordinate system here.
+  return { sheet: sheetNumber, thumbnail, tiles, scale: 1 };
+}
+
 export async function renderSheet(
   pdfPath: string,
   pdfPage: number,

@@ -173,6 +173,45 @@ export function layoutLines(sheet: SheetInventory): string[] {
     .filter((l) => l.trim().length > 0);
 }
 
+/**
+ * Intake for a raster sheet (PNG, JPG, TIFF) rather than a PDF.
+ *
+ * A bitmap has no text layer at all, so it carries no inventory metadata and
+ * every fact has to come from the vision pass. Reported honestly as such rather
+ * than dressed up with a guessed title or scale.
+ */
+export async function intakeImage(filePath: string, name: string): Promise<IntakeResult> {
+  const { readFileSync } = await import('node:fs');
+  const sharp = (await import('sharp')).default;
+
+  const buf = readFileSync(filePath);
+  const file_sha256 = createHash('sha256').update(buf).digest('hex');
+  const meta = await sharp(buf).metadata();
+
+  // Treat image pixels as points at 1:1; the vision pass works in tile pixels
+  // and no text-layer coordinates exist to reconcile against.
+  const sheet: SheetInventory = {
+    number: '01',
+    title: name,
+    scale_statement: null,
+    not_to_scale: false,
+    units: 'unknown',
+    size_pt: { width: meta.width ?? 1000, height: meta.height ?? 1000 },
+    pdf_page: 1,
+    text_items: [],
+    has_text_layer: false,
+  };
+
+  return {
+    file_sha256,
+    sheets: [sheet],
+    warnings: [
+      `${name}: raster image with no text layer, so every value must come from the vision pass and carries its lower confidence.`,
+      `${name}: no title block or scale statement could be read, so the sheet's own scale and units are unknown.`,
+    ],
+  };
+}
+
 export async function intake(filePath: string): Promise<IntakeResult> {
   const { readFileSync } = await import('node:fs');
   const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs');

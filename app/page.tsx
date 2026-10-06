@@ -2,46 +2,82 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { SignedIn, SignedOut, SignInButton, SignUpButton, UserButton } from '@clerk/nextjs';
-import type { AnalysisResult, ExtractedSheet, FileType, Violation } from '@/lib/types';
-import { totalAnnotationCount, type AnnotationBuckets } from '@/lib/annotations';
+import type { Fact, Finding, FindingStatus } from '@/lib/schemas';
+import type { ReviewResult, SheetSummary } from '@/lib/review';
 
 type Theme = 'dark' | 'light';
 
-type SeverityFilter = 'all' | 'critical' | 'major' | 'minor';
-type TypeFilter = 'all' | 'compliance' | 'consistency';
+/** The §8 statuses, plus "all". Severity is gone: a finding has a status. */
+type StatusFilter = 'all' | FindingStatus;
 
 interface PendingFile {
   file: File;
-  fileType: FileType;
+  /** 'pdf' or 'image'. DWG and IFC are not supported yet. */
+  kind: 'pdf' | 'image';
 }
+
+type ApiResult = ReviewResult & { plan_id: string };
 
 interface PipelineStep {
   label: string;
   status: 'pending' | 'active' | 'done';
 }
 
-const ACCEPTED_EXTS = ['pdf', 'png', 'jpg', 'jpeg', 'tif', 'tiff', 'dxf', 'dwg'];
-const ACCEPT_ATTR = '.pdf,.png,.jpg,.jpeg,.tif,.tiff,.dxf,.dwg';
+// DXF and DWG are no longer accepted. The old DXF path produced data in the
+// retired ExtractedSheet shape that the rule engine cannot read, and offering
+// an upload that silently yields nothing is worse than refusing it. Both are
+// tracked in ROADMAP.md.
+const ACCEPTED_EXTS = ['pdf', 'png', 'jpg', 'jpeg', 'tif', 'tiff', 'webp'];
+const ACCEPT_ATTR = '.pdf,.png,.jpg,.jpeg,.tif,.tiff,.webp';
 
-function detectFileType(filename: string): FileType {
+function detectKind(filename: string): 'pdf' | 'image' {
   const ext = filename.split('.').pop()?.toLowerCase() ?? '';
-  if (ext === 'pdf') return 'pdf';
-  if (ext === 'dxf') return 'dxf';
-  if (ext === 'dwg') return 'dwg';
-  return 'image';
+  return ext === 'pdf' ? 'pdf' : 'image';
 }
 
-function severityColor(severity: Violation['severity']): string {
-  if (severity === 'critical') return '#EF4444';
-  if (severity === 'major') return '#F59E0B';
-  return '#3B82F6';
+const STATUS_ORDER: FindingStatus[] = [
+  'fail',
+  'drawing_conflict',
+  'needs_confirmation',
+  'cant_determine',
+  'pass',
+];
+
+const STATUS_LABEL: Record<FindingStatus, string> = {
+  fail: 'Fail',
+  drawing_conflict: 'Drawing conflict',
+  needs_confirmation: 'Needs confirmation',
+  cant_determine: "Can't determine",
+  pass: 'Pass',
+};
+
+/**
+ * Colour carries meaning here, so it follows the §8 statuses rather than a
+ * severity scale. "Can't determine" is deliberately neutral grey: it is a gap
+ * in the drawings, not a problem with the building, and colouring it like a
+ * warning taught readers to treat a missing dimension as a defect.
+ */
+function statusColor(status: FindingStatus): string {
+  switch (status) {
+    case 'fail':
+      return '#EF4444';
+    case 'drawing_conflict':
+      return '#F59E0B';
+    case 'needs_confirmation':
+      return '#EAB308';
+    case 'cant_determine':
+      return '#6B7280';
+    case 'pass':
+      return '#10B981';
+  }
 }
 
 const INITIAL_STEPS: PipelineStep[] = [
-  { label: 'Parsing files', status: 'pending' },
-  { label: 'Extracting plan data', status: 'pending' },
-  { label: 'Retrieving code sections', status: 'pending' },
-  { label: 'Analyzing violations', status: 'pending' },
+  { label: 'Reading the sheets', status: 'pending' },
+  { label: 'Determining which code Part governs', status: 'pending' },
+  { label: 'Reading values off the drawings', status: 'pending' },
+  { label: 'Checking the rules', status: 'pending' },
+  { label: 'Trying to refute each finding', status: 'pending' },
 ];
 
 // Rotating one-liners shown while the analysis runs, so the wait has some
@@ -89,10 +125,9 @@ export default function PlanqPage() {
   const [analyzing, setAnalyzing] = useState(false);
   const [progress, setProgress] = useState(0);
   const [quipIdx, setQuipIdx] = useState(0);
-  const [result, setResult] = useState<AnalysisResult | null>(null);
+  const [result, setResult] = useState<ApiResult | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [severityFilter, setSeverityFilter] = useState<SeverityFilter>('all');
-  const [typeFilter, setTypeFilter] = useState<TypeFilter>('all');
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
   const inputRef = useRef<HTMLInputElement>(null);
 
   const ingestFiles = useCallback((incoming: FileList | File[]) => {
@@ -101,7 +136,7 @@ export default function PlanqPage() {
     for (const file of list) {
       const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
       if (!ACCEPTED_EXTS.includes(ext)) continue;
-      accepted.push({ file, fileType: detectFileType(file.name) });
+      accepted.push({ file, kind: detectKind(file.name) });
     }
     if (accepted.length === 0) return;
     setFiles((prev) => [...prev, ...accepted]);
@@ -175,8 +210,9 @@ export default function PlanqPage() {
         const detail = await res.json().catch(() => ({}));
         throw new Error(detail?.error || `Analysis failed (${res.status})`);
       }
-      const json = (await res.json()) as AnalysisResult;
+      const json = (await res.json()) as ApiResult;
       advanceStep(3, 'done');
+      advanceStep(4, 'done');
       setProgress(100);
       setResult(json);
     } catch (err) {
@@ -190,14 +226,18 @@ export default function PlanqPage() {
     }
   };
 
-  const filteredViolations = useMemo(() => {
+  const filteredFindings = useMemo(() => {
     if (!result) return [];
-    return result.violations.filter((v) => {
-      if (severityFilter !== 'all' && v.severity !== severityFilter) return false;
-      if (typeFilter !== 'all' && v.type !== typeFilter) return false;
-      return true;
-    });
-  }, [result, severityFilter, typeFilter]);
+    const list =
+      statusFilter === 'all'
+        ? result.findings
+        : result.findings.filter((f) => f.status === statusFilter);
+    // Most severe first, so a reader does not have to scroll past the gaps to
+    // reach the failures.
+    return [...list].sort(
+      (a, b) => STATUS_ORDER.indexOf(a.status) - STATUS_ORDER.indexOf(b.status),
+    );
+  }, [result, statusFilter]);
 
   const canAnalyze = !analyzing && files.length > 0;
 
@@ -278,7 +318,7 @@ export default function PlanqPage() {
                   >
                     <div className="flex min-w-0 items-center gap-3">
                       <span className="rounded-full border border-border px-2 py-[2px] font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-                        {pf.fileType}
+                        {pf.kind}
                       </span>
                       <span className="truncate text-sm">{pf.file.name}</span>
                       <span className="font-mono text-[10px] text-muted-foreground">
@@ -331,51 +371,54 @@ export default function PlanqPage() {
         <section className="border-t border-border px-6 py-20 md:px-12 md:py-28 lg:px-20 lg:py-32">
           <div className="mx-auto max-w-5xl space-y-12">
             <div>
-              <Eyebrow>Verdict</Eyebrow>
+              <Eyebrow>
+                {result.status === 'needs_manual_review' ? 'Stopped' : 'Review summary'}
+              </Eyebrow>
               <h2 className="mt-3 text-3xl font-medium tracking-tight md:text-4xl lg:text-5xl">
-                {result.violations.length === 0
-                  ? 'No violations found.'
-                  : `${result.violations.length} violation${
-                      result.violations.length === 1 ? '' : 's'
-                    } across ${result.sheets_analyzed} sheet${
-                      result.sheets_analyzed === 1 ? '' : 's'
-                    }.`}
+                {result.stopped_reason
+                  ? 'This set needs a human before it can be reviewed.'
+                  : result.counts.fail > 0
+                    ? `${result.counts.fail} confirmed ${result.counts.fail === 1 ? 'failure' : 'failures'} across ${result.sheets.length} sheet${result.sheets.length === 1 ? '' : 's'}.`
+                    : result.counts.needs_confirmation + result.counts.drawing_conflict > 0
+                      ? 'Nothing confirmed as a failure, but items need confirmation.'
+                      : 'Nothing could be confirmed as a failure.'}
               </h2>
+              {result.stopped_reason && (
+                <p className="mt-4 max-w-2xl text-sm leading-relaxed text-muted-foreground">
+                  {result.stopped_reason}
+                </p>
+              )}
             </div>
 
-            <StatStrip
-              items={[
-                { label: 'Total', value: result.violations.length },
-                {
-                  label: 'Critical',
-                  value: result.summary.critical,
-                  color: '#EF4444',
-                },
-                {
-                  label: 'Major',
-                  value: result.summary.major,
-                  color: '#F59E0B',
-                },
-                {
-                  label: 'Minor',
-                  value: result.summary.minor,
-                  color: '#3B82F6',
-                },
-                { label: 'Compliance', value: result.summary.compliance },
-                { label: 'Consistency', value: result.summary.consistency },
-              ]}
-            />
+            {/* §G9: nothing here is a released report. */}
+            <div className="rounded-2xl border border-border bg-secondary/30 px-6 py-5">
+              <p className="text-sm leading-relaxed text-muted-foreground">
+                This is a pre-submission review to help prepare a permit application. It is not a
+                permit approval or a substitute for review by the authority having jurisdiction or a
+                registered professional. No report is released until a named reviewer approves it.
+              </p>
+            </div>
 
-            {result.warnings && result.warnings.length > 0 && (
+            {!result.stopped_reason && (
+              <StatStrip
+                items={STATUS_ORDER.map((st) => ({
+                  label: STATUS_LABEL[st],
+                  value: result.counts[st],
+                  color: statusColor(st),
+                }))}
+              />
+            )}
+
+            {result.applicability && (
+              <ApplicabilityPanel applicability={result.applicability} />
+            )}
+
+            {result.warnings.length > 0 && (
               <div className="rounded-2xl border border-border bg-secondary/30 px-6 py-5">
-                <Eyebrow>Warnings</Eyebrow>
-                <ul className="mt-3 space-y-1">
+                <Eyebrow>Before you read this</Eyebrow>
+                <ul className="mt-3 space-y-2">
                   {result.warnings.map((w, i) => (
-                    <li
-                      key={i}
-                      className="font-mono text-xs"
-                      style={{ color: '#F59E0B' }}
-                    >
+                    <li key={i} className="text-xs leading-relaxed" style={{ color: '#F59E0B' }}>
                       {w}
                     </li>
                   ))}
@@ -383,82 +426,70 @@ export default function PlanqPage() {
               </div>
             )}
 
-            {result.sheets && result.sheets.length > 0 && (
-              <ExtractedSheetsPanel sheets={result.sheets} />
-            )}
-
-            <div>
-              <Eyebrow>Violations</Eyebrow>
-              <div className="mt-4 flex flex-wrap gap-2">
-                <FilterButton
-                  active={severityFilter === 'all' && typeFilter === 'all'}
-                  onClick={() => {
-                    setSeverityFilter('all');
-                    setTypeFilter('all');
-                  }}
-                >
-                  All
-                </FilterButton>
-                <FilterButton
-                  active={severityFilter === 'critical'}
-                  onClick={() => setSeverityFilter('critical')}
-                >
-                  Critical
-                </FilterButton>
-                <FilterButton
-                  active={severityFilter === 'major'}
-                  onClick={() => setSeverityFilter('major')}
-                >
-                  Major
-                </FilterButton>
-                <FilterButton
-                  active={severityFilter === 'minor'}
-                  onClick={() => setSeverityFilter('minor')}
-                >
-                  Minor
-                </FilterButton>
-                <FilterButton
-                  active={typeFilter === 'compliance'}
-                  onClick={() => setTypeFilter('compliance')}
-                >
-                  Compliance
-                </FilterButton>
-                <FilterButton
-                  active={typeFilter === 'consistency'}
-                  onClick={() => setTypeFilter('consistency')}
-                >
-                  Consistency
-                </FilterButton>
-              </div>
-            </div>
-
-            {filteredViolations.length === 0 ? (
-              <div className="rounded-2xl border border-border bg-secondary/30 px-6 py-16 text-center">
-                <Eyebrow>{result.violations.length === 0 ? 'Clean' : 'No matches'}</Eyebrow>
-                <p className="mt-3 text-2xl font-medium tracking-tight md:text-3xl">
-                  {result.violations.length === 0
-                    ? 'These plans look clean.'
-                    : 'Nothing matches the current filter.'}
+            {result.assumed_conventions.length > 0 && (
+              <div className="rounded-2xl border border-border bg-secondary/30 px-6 py-5">
+                <Eyebrow>Notation assumed, not read</Eyebrow>
+                <p className="mt-3 text-xs leading-relaxed text-muted-foreground">
+                  The drawings did not declare these in a legend, so their meaning was assumed. A
+                  finding that depends on one of them should be checked by eye.
                 </p>
-                {result.violations.length > 0 && (
-                  <button
-                    onClick={() => {
-                      setSeverityFilter('all');
-                      setTypeFilter('all');
-                    }}
-                    className="mt-6 rounded-full border border-border px-4 py-2 text-sm transition-colors hover:bg-foreground hover:text-background"
-                  >
-                    Clear filter
-                  </button>
-                )}
+                <p className="mt-2 font-mono text-[11px] text-muted-foreground">
+                  {result.assumed_conventions.join('  ·  ')}
+                </p>
               </div>
-            ) : (
-              <ul className="space-y-3">
-                {filteredViolations.map((v, i) => (
-                  <ViolationCard key={i} violation={v} />
-                ))}
-              </ul>
             )}
+
+            {result.sheets.length > 0 && (
+              <SheetsPanel sheets={result.sheets} facts={result.facts} />
+            )}
+
+            {!result.stopped_reason && (
+              <>
+                <div>
+                  <Eyebrow>Findings</Eyebrow>
+                  <div className="mt-4 flex flex-wrap gap-2">
+                    <FilterButton
+                      active={statusFilter === 'all'}
+                      onClick={() => setStatusFilter('all')}
+                    >
+                      All {result.findings.length}
+                    </FilterButton>
+                    {STATUS_ORDER.filter((st) => result.counts[st] > 0).map((st) => (
+                      <FilterButton
+                        key={st}
+                        active={statusFilter === st}
+                        onClick={() => setStatusFilter(st)}
+                      >
+                        {STATUS_LABEL[st]} {result.counts[st]}
+                      </FilterButton>
+                    ))}
+                  </div>
+                </div>
+
+                {filteredFindings.length === 0 ? (
+                  <div className="rounded-2xl border border-border bg-secondary/30 px-6 py-16 text-center">
+                    <Eyebrow>No matches</Eyebrow>
+                    <p className="mt-3 text-2xl font-medium tracking-tight md:text-3xl">
+                      Nothing matches the current filter.
+                    </p>
+                    <button
+                      onClick={() => setStatusFilter('all')}
+                      className="mt-6 rounded-full border border-border px-4 py-2 text-sm transition-colors hover:bg-foreground hover:text-background"
+                    >
+                      Clear filter
+                    </button>
+                  </div>
+                ) : (
+                  <ul className="space-y-3">
+                    {filteredFindings.map((f) => (
+                      <FindingCard key={f.id} finding={f} />
+                    ))}
+                  </ul>
+                )}
+              </>
+            )}
+
+            <RunFooter result={result} />
           </div>
         </section>
       )}
@@ -631,67 +662,110 @@ function StatStrip({
 }
 
 /**
- * What stands behind a finding, in one badge. Today every finding is
- * deterministic: arithmetic against the rules table, not a model judgement.
- * PLANQ_SPEC.md §S4 adds an adversarial verifier whose upheld/refuted/uncertain
- * verdict belongs here, and §8 replaces this card with the five-way status.
+ * What stands behind a finding, in one badge: the arithmetic, and then what the
+ * independent verifier made of it (§S4). A verifier verdict short of "upheld"
+ * says so plainly rather than reading as settled fact.
  */
-function ProvenanceBadge({ violation: v }: { violation: Violation }) {
-  const base =
-    'rounded-full border px-2 py-[2px] font-mono text-[10px] uppercase tracking-widest';
+function ProvenanceBadge({ finding: f }: { finding: Finding }) {
+  const base = 'rounded-full border px-2 py-[2px] font-mono text-[10px] uppercase tracking-widest';
 
-  if (v.source === 'rule_engine') {
+  if (f.verifier === 'upheld') {
     return (
       <span
         className={`${base} border-emerald-500/40 text-emerald-500`}
-        title="Measured against the code rules table — arithmetic, not a model judgement"
+        title="A second model was asked to refute this finding and could not"
       >
-        measured
+        upheld
       </span>
     );
   }
-
-  return null;
+  if (f.verifier === 'refuted' || f.verifier === 'uncertain') {
+    return (
+      <span
+        className={`${base} border-amber-500/40 text-amber-500`}
+        title={f.verifier_reason ?? 'The independent check could not uphold this finding'}
+      >
+        {f.verifier === 'refuted' ? 'refuted' : 'unsettled'}
+      </span>
+    );
+  }
+  return (
+    <span
+      className={`${base} border-border text-muted-foreground`}
+      title="Measured in code against the rules table. Not sent to the independent verifier, which only reviews failures and items needing confirmation."
+    >
+      measured
+    </span>
+  );
 }
 
-function ViolationCard({ violation: v }: { violation: Violation }) {
+function FindingCard({ finding: f }: { finding: Finding }) {
+  const color = statusColor(f.status);
   return (
     <li
       className="rounded-2xl border border-border bg-secondary/30 px-6 py-5"
-      style={{ borderLeftColor: severityColor(v.severity), borderLeftWidth: 3 }}
+      style={{ borderLeftColor: color, borderLeftWidth: 3 }}
     >
       <div className="mb-3 flex flex-wrap items-center gap-2">
-        <span className="rounded-full border border-border px-2 py-[2px] font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-          {v.type}
-        </span>
         <span
-          className="font-mono text-[10px] uppercase tracking-widest"
-          style={{ color: severityColor(v.severity) }}
+          className="rounded-full px-2 py-[2px] font-mono text-[10px] uppercase tracking-widest"
+          style={{ color, border: `1px solid ${color}55` }}
         >
-          {v.severity}
+          {STATUS_LABEL[f.status]}
         </span>
-        {v.section_id && (
-          <span className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-            §{v.section_id}
-          </span>
-        )}
-        <ProvenanceBadge violation={v} />
+        <span className="rounded-full border border-border px-2 py-[2px] font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+          {f.id} · {f.rule_id}
+        </span>
+        <ProvenanceBadge finding={f} />
       </div>
-      <p className="text-sm leading-relaxed md:text-base">{v.description}</p>
-      <div className="mt-3 space-y-1">
-        {v.code_citation && v.type === 'compliance' && (
-          <p className="font-mono text-xs text-muted-foreground">{v.code_citation}</p>
-        )}
-        {v.affected_sheets && v.affected_sheets.length > 0 && v.type === 'consistency' && (
-          <p className="font-mono text-xs text-muted-foreground">
-            sheets: {v.affected_sheets.join(', ')}
-          </p>
-        )}
-        {v.location_hint && (
-          <p className="font-mono text-xs text-muted-foreground">
-            location: {v.location_hint}
-          </p>
-        )}
+
+      <p className="text-sm leading-relaxed">{f.summary}</p>
+
+      {Object.keys(f.computed).length > 0 && (
+        <div className="mt-3 flex flex-wrap gap-x-5 gap-y-1">
+          {Object.entries(f.computed)
+            .filter(([, v]) => v !== '' && v != null)
+            .map(([k, v]) => (
+              <span key={k} className="font-mono text-[11px] text-muted-foreground">
+                {k.replace(/_/g, ' ')}: <span className="text-foreground">{String(v)}</span>
+              </span>
+            ))}
+        </div>
+      )}
+
+      {/* §G3: the quote comes from the clause store, never from a model. */}
+      {f.clause_quotes.length > 0 && (
+        <div className="mt-4 space-y-2 border-l border-border pl-4">
+          {f.clause_quotes.map((q, i) => (
+            <p key={i} className="text-xs leading-relaxed text-muted-foreground">
+              <span className="font-mono text-[11px] text-foreground">
+                {f.clause_ids[i] ?? ''}
+              </span>{' '}
+              {q}
+            </p>
+          ))}
+        </div>
+      )}
+
+      {f.status !== 'pass' && f.required_action && (
+        <p className="mt-4 text-xs leading-relaxed">
+          <span className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+            Action{' '}
+          </span>
+          {f.required_action}
+        </p>
+      )}
+
+      {f.verifier_reason && (
+        <p className="mt-3 text-xs leading-relaxed text-muted-foreground">
+          <span className="font-mono text-[10px] uppercase tracking-widest">Independent check </span>
+          {f.verifier_reason}
+        </p>
+      )}
+
+      <div className="mt-4 flex flex-wrap gap-x-4 font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+        {f.drawing_reference && <span>{f.drawing_reference}</span>}
+        <span>reviewer: {f.reviewer_state}</span>
       </div>
     </li>
   );
@@ -720,281 +794,129 @@ function FilterButton({
   );
 }
 
-function ExtractedSheetsPanel({ sheets }: { sheets: ExtractedSheet[] }) {
-  const [openIndex, setOpenIndex] = useState<number | null>(0);
-
-  return (
-    <div>
-      <Eyebrow>Extracted plan data</Eyebrow>
-      <div className="mt-4 overflow-hidden rounded-2xl border border-border">
-        {sheets.map((sheet, idx) => {
-          const isOpen = openIndex === idx;
-          const counts = [
-            ['rooms', sheet.rooms.length],
-            ['doors', sheet.doors.length],
-            ['corridors', sheet.corridors.length],
-            ['stairs', sheet.stairs.length],
-            ['egress', sheet.egress_paths.length],
-            ['dimensions', sheet.dimensions.length],
-          ] as const;
-          return (
-            <div
-              key={`${sheet.sheet_name}-${idx}`}
-              className="border-b border-border last:border-b-0"
-            >
-              <button
-                onClick={() => setOpenIndex(isOpen ? null : idx)}
-                className="flex w-full flex-wrap items-center justify-between gap-3 bg-card px-5 py-4 text-left transition-colors hover:bg-secondary/50"
-              >
-                <div className="flex flex-wrap items-center gap-3">
-                  <span className="rounded-full border border-border px-2 py-[2px] font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-                    {sheet.file_type}
-                  </span>
-                  <span className="text-sm font-medium">{sheet.sheet_name}</span>
-                  {(sheet.occupancy_type || sheet.building_type) && (
-                    <span className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-                      {[sheet.occupancy_type, sheet.building_type].filter(Boolean).join(' / ')}
-                    </span>
-                  )}
-                </div>
-                <span className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-                  {counts.map(([k, v]) => `${v} ${k}`).join('  ·  ')}
-                </span>
-              </button>
-              {isOpen && (
-                <div className="grid grid-cols-1 gap-8 border-t border-border bg-secondary/20 px-5 py-6 md:grid-cols-2">
-                  {(sheet.occupancy_type || sheet.building_type) && (
-                    <div className="md:col-span-2">
-                      <SectionLabel>Classification</SectionLabel>
-                      <p className="text-sm">
-                        {sheet.occupancy_type ? (
-                          <>
-                            <span className="text-muted-foreground">occupancy:</span>{' '}
-                            {sheet.occupancy_type}
-                          </>
-                        ) : null}
-                        {sheet.occupancy_type && sheet.building_type ? '  ·  ' : null}
-                        {sheet.building_type ? (
-                          <>
-                            <span className="text-muted-foreground">building type:</span>{' '}
-                            {sheet.building_type}
-                          </>
-                        ) : null}
-                      </p>
-                    </div>
-                  )}
-
-                  <ListBlock label="Rooms" empty={sheet.rooms.length === 0}>
-                    {sheet.rooms.map((r, i) => (
-                      <li key={i} className="text-sm">
-                        {r.name}
-                        {r.dimensions ? (
-                          <span className="font-mono text-[11px] text-muted-foreground">
-                            {' '}
-                            · {r.dimensions}
-                          </span>
-                        ) : null}
-                        {r.area ? (
-                          <span className="font-mono text-[11px] text-muted-foreground">
-                            {' '}
-                            · {r.area}
-                          </span>
-                        ) : null}
-                      </li>
-                    ))}
-                  </ListBlock>
-
-                  <ListBlock label="Doors" empty={sheet.doors.length === 0}>
-                    {sheet.doors.map((d, i) => (
-                      <li key={i} className="text-sm">
-                        {d.location}
-                        {d.width ? (
-                          <span className="font-mono text-[11px] text-muted-foreground">
-                            {' '}
-                            · {d.width}
-                          </span>
-                        ) : null}
-                        {d.type ? (
-                          <span className="font-mono text-[11px] text-muted-foreground">
-                            {' '}
-                            · {d.type}
-                          </span>
-                        ) : null}
-                      </li>
-                    ))}
-                  </ListBlock>
-
-                  <ListBlock label="Corridors" empty={sheet.corridors.length === 0}>
-                    {sheet.corridors.map((c, i) => (
-                      <li key={i} className="text-sm">
-                        {c.location}
-                        {c.width ? (
-                          <span className="font-mono text-[11px] text-muted-foreground">
-                            {' '}
-                            · {c.width}
-                          </span>
-                        ) : null}
-                        {c.length ? (
-                          <span className="font-mono text-[11px] text-muted-foreground">
-                            {' '}
-                            · {c.length}
-                          </span>
-                        ) : null}
-                      </li>
-                    ))}
-                  </ListBlock>
-
-                  <ListBlock label="Stairs" empty={sheet.stairs.length === 0}>
-                    {sheet.stairs.map((s, i) => (
-                      <li key={i} className="text-sm">
-                        {s.location}
-                        {s.width ? (
-                          <span className="font-mono text-[11px] text-muted-foreground">
-                            {' '}
-                            · w {s.width}
-                          </span>
-                        ) : null}
-                        {s.rise ? (
-                          <span className="font-mono text-[11px] text-muted-foreground">
-                            {' '}
-                            · r {s.rise}
-                          </span>
-                        ) : null}
-                        {s.run ? (
-                          <span className="font-mono text-[11px] text-muted-foreground">
-                            {' '}
-                            · run {s.run}
-                          </span>
-                        ) : null}
-                      </li>
-                    ))}
-                  </ListBlock>
-
-                  <ListBlock label="Egress paths" empty={sheet.egress_paths.length === 0}>
-                    {sheet.egress_paths.map((e, i) => (
-                      <li key={i} className="text-sm">
-                        {e.from} → {e.to}
-                        {e.width ? (
-                          <span className="font-mono text-[11px] text-muted-foreground">
-                            {' '}
-                            · {e.width}
-                          </span>
-                        ) : null}
-                      </li>
-                    ))}
-                  </ListBlock>
-
-                  <ListBlock label="Dimensions" empty={sheet.dimensions.length === 0}>
-                    {sheet.dimensions.slice(0, 12).map((d, i) => (
-                      <li key={i} className="font-mono text-[11px]">
-                        {d.element}: {d.value} {d.unit}
-                      </li>
-                    ))}
-                    {sheet.dimensions.length > 12 && (
-                      <li className="font-mono text-[10px] text-muted-foreground">
-                        …and {sheet.dimensions.length - 12} more
-                      </li>
-                    )}
-                  </ListBlock>
-
-                  {totalAnnotationCount(sheet.annotations) > 0 && (
-                    <div className="md:col-span-2">
-                      <AnnotationsView buckets={sheet.annotations} />
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
-
-function SectionLabel({ children }: { children: React.ReactNode }) {
-  return (
-    <p className="mb-2 font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-      {children}
-    </p>
-  );
-}
-
-function ListBlock({
-  label,
-  empty,
-  children,
+function ApplicabilityPanel({
+  applicability: a,
 }: {
-  label: string;
-  empty: boolean;
-  children: React.ReactNode;
+  applicability: NonNullable<ApiResult['applicability']>;
 }) {
+  const rows: Array<[string, string]> = [
+    ['Major occupancy', a.major_occupancy],
+    ['Storeys', String(a.storeys)],
+    ['Building area', `${a.building_area_m2} m2`],
+    ['Technical Part', `Part ${a.code_parts.join(', ')}`],
+    ['Energy', a.energy_path === 'NBC_9.36' ? 'Section 9.36' : 'NECB 2020'],
+  ];
   return (
-    <div>
-      <SectionLabel>{label}</SectionLabel>
-      {empty ? (
-        <p className="font-mono text-[11px] text-muted-foreground">none</p>
-      ) : (
-        <ul className="space-y-1">{children}</ul>
-      )}
+    <div className="overflow-hidden rounded-2xl border border-border">
+      <div className="border-b border-border bg-secondary/40 px-5 py-3">
+        <Eyebrow>Applicability</Eyebrow>
+        <p className="mt-1 font-mono text-[11px] text-muted-foreground">
+          {a.edition} · confidence {(a.confidence * 100).toFixed(0)} percent
+        </p>
+      </div>
+      <dl className="divide-y divide-border">
+        {rows.map(([k, v]) => (
+          <div key={k} className="flex flex-wrap gap-2 px-5 py-3">
+            <dt className="w-44 font-mono text-[11px] uppercase tracking-widest text-muted-foreground">
+              {k}
+            </dt>
+            <dd className="min-w-0 flex-1 text-sm">{v}</dd>
+          </div>
+        ))}
+      </dl>
+      {/* Why each determination was reached, since the Part decides every rule. */}
+      <div className="space-y-1 border-t border-border bg-secondary/20 px-5 py-3">
+        {Object.entries(a.basis).map(([k, v]) => (
+          <p key={k} className="text-[11px] leading-relaxed text-muted-foreground">
+            <span className="font-mono">{k.replace(/_/g, ' ')}:</span> {v}
+          </p>
+        ))}
+      </div>
     </div>
   );
 }
 
-function AnnotationsView({ buckets }: { buckets: AnnotationBuckets }) {
-  const [showAll, setShowAll] = useState(false);
-  const groups: Array<{ label: string; items: string[]; mono?: boolean }> = [
-    { label: 'Rooms (from labels)', items: buckets.rooms },
-    { label: 'Doors', items: buckets.doors, mono: true },
-    { label: 'Dimensions', items: buckets.dimensions, mono: true },
-    { label: 'Levels', items: buckets.levels, mono: true },
-    { label: 'Totals & areas', items: buckets.totals },
-    { label: 'Sections / elevations', items: buckets.sections },
-    { label: 'Other', items: buckets.other },
-  ].filter((g) => g.items.length > 0);
-
-  if (groups.length === 0) return null;
-
+function SheetsPanel({ sheets, facts }: { sheets: SheetSummary[]; facts: Fact[] }) {
   return (
-    <div>
-      <div className="mb-3 flex items-center justify-between">
-        <SectionLabel>Annotations</SectionLabel>
-        <button
-          onClick={() => setShowAll((v) => !v)}
-          className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground transition-colors hover:text-foreground"
-        >
-          {showAll ? 'Collapse' : 'Show all'}
-        </button>
+    <div className="overflow-hidden rounded-2xl border border-border">
+      <div className="border-b border-border bg-secondary/40 px-5 py-3">
+        <Eyebrow>Sheets read</Eyebrow>
       </div>
-      <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-        {groups.map((g) => {
-          const limit = showAll ? g.items.length : Math.min(8, g.items.length);
-          const shown = g.items.slice(0, limit);
+      <ul className="divide-y divide-border">
+        {sheets.map((s) => {
+          const mine = facts.filter(
+            (f) => f.provenance === 'drawing_text' && f.sheet === s.number,
+          );
           return (
-            <div key={g.label} className="rounded-2xl border border-border bg-card px-4 py-3">
-              <p className="mb-2 font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-                {g.label} ({g.items.length})
-              </p>
-              <ul className="space-y-[2px]">
-                {shown.map((item, i) => (
-                  <li
-                    key={i}
-                    className={`${
-                      g.mono ? 'font-mono text-[11px]' : 'text-xs'
-                    } text-foreground`}
-                  >
-                    {item}
-                  </li>
-                ))}
-                {g.items.length > limit && (
-                  <li className="font-mono text-[10px] text-muted-foreground">
-                    …+{g.items.length - limit} more
-                  </li>
+            <li key={s.number} className="px-5 py-4">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="font-mono text-[11px] text-muted-foreground">{s.number}</span>
+                <span className="text-sm">{s.title}</span>
+                {s.not_to_scale && (
+                  <span className="rounded-full border border-amber-500/40 px-2 py-[2px] font-mono text-[10px] uppercase tracking-widest text-amber-500">
+                    not to scale
+                  </span>
                 )}
-              </ul>
-            </div>
+                {!s.has_text_layer && (
+                  <span className="rounded-full border border-border px-2 py-[2px] font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+                    no text layer
+                  </span>
+                )}
+                <span className="rounded-full border border-border px-2 py-[2px] font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+                  {s.units}
+                </span>
+              </div>
+
+              {mine.length === 0 ? (
+                <p className="mt-3 text-xs text-muted-foreground">
+                  No value could be read off this sheet.
+                </p>
+              ) : (
+                <ul className="mt-3 space-y-1">
+                  {mine.map((f) => (
+                    <li key={f.id} className="font-mono text-[11px] text-muted-foreground">
+                      <span className="text-foreground">
+                        {f.kind.replace(/_/g, ' ')} = {String(f.value)}
+                        {f.unit ? ` ${f.unit}` : ''}
+                      </span>
+                      {' · '}
+                      {f.subject}
+                      {' · '}
+                      <span title="Read verbatim off the sheet">&ldquo;{f.source_text}&rdquo;</span>
+                      {!f.stable && (
+                        <span className="text-amber-500" title="Read in only one of two passes, so it cannot support a failure">
+                          {' '}
+                          unstable
+                        </span>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </li>
           );
         })}
+      </ul>
+    </div>
+  );
+}
+
+/** §G10: what produced this run, visible rather than buried in a log. */
+function RunFooter({ result }: { result: ApiResult }) {
+  return (
+    <div className="rounded-2xl border border-border px-5 py-4">
+      <Eyebrow>Run</Eyebrow>
+      <div className="mt-2 flex flex-wrap gap-x-5 gap-y-1 font-mono text-[11px] text-muted-foreground">
+        <span>run {result.run_id}</span>
+        <span>{result.code_edition}</span>
+        <span>store {result.code_store_hash.slice(0, 12)}</span>
+        <span>${result.audit.total_cost_usd.toFixed(4)}</span>
+        <span>{result.audit.usage.length} model calls</span>
+        {result.verification.checked > 0 && (
+          <span>
+            {result.verification.checked} verified, {result.verification.downgraded} downgraded
+          </span>
+        )}
       </div>
     </div>
   );
