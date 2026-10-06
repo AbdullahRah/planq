@@ -9,7 +9,7 @@ import { BudgetExceededError } from '@/lib/stages/runner';
 import { RUN_BUDGET_USD } from '@/lib/claude';
 
 export const runtime = 'nodejs';
-export const maxDuration = 800;
+export const maxDuration = 300;
 
 /**
  * Run a review (PLANQ_SPEC.md §4).
