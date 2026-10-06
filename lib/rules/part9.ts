@@ -1,0 +1,288 @@
+// The v1 rule set (PLANQ_SPEC.md §6).
+//
+// PROVENANCE, and why this file is hand-written rather than generated:
+// §6 requires a human to transcribe every threshold from the PDF and forbids a
+// model from writing one. The numbers below are transcribed from the §6 table
+// in PLANQ_SPEC.md, which the owner authored. They are not read out of the PDF
+// by anything automated, and they are not recalled from training.
+//
+// scripts/verify-rules.ts closes the loop: for every rule it looks the clause up
+// in the built store and asserts the threshold appears in the real clause text,
+// reporting the printed and pdf page it found it on. A number that is in this
+// file but not in the code fails that check loudly instead of quietly shipping.
+// If the spec and the code disagree, that is a question for the owner, not
+// something to patch here.
+
+import type { Rule } from '../schemas';
+
+export const PART9_RULES: Rule[] = [
+  {
+    id: 'guard-height',
+    title: 'Height of guards',
+    clause_ids: ['9.8.8.3.(1)', '9.8.8.3.(2)', '9.8.8.3.(3)'],
+    applies_when: { code_part: '9' },
+    test: {
+      kind: 'numeric',
+      fact_kind: 'guard_height_mm',
+      operator: 'gte',
+      value: 1070,
+      unit: 'mm',
+    },
+    transcribed_from: { printed_page: '9-30', pdf_page: 860 },
+    required_action: 'Raise the guard to at least 1 070 mm, or show that a listed exception applies.',
+    precision: null,
+    precision_measured_at: null,
+  },
+  {
+    id: 'guard-openings',
+    title: 'Openings in guards',
+    clause_ids: ['9.8.8.5.(1)'],
+    applies_when: { code_part: '9' },
+    test: {
+      kind: 'numeric',
+      fact_kind: 'guard_opening_mm',
+      operator: 'lte',
+      value: 100,
+      unit: 'mm',
+    },
+    transcribed_from: { printed_page: '9-31', pdf_page: 861 },
+    required_action: 'Detail guard infill so a 100 mm sphere cannot pass through.',
+    precision: null,
+    precision_measured_at: null,
+  },
+  {
+    id: 'door-width-entrance',
+    title: 'Doorway opening sizes, required entrance and stairs',
+    clause_ids: ['9.5.5.1.(1)'],
+    applies_when: { code_part: '9', predicate: 'door_serves_entrance_or_stair' },
+    test: {
+      kind: 'numeric',
+      fact_kind: 'door_width_mm',
+      operator: 'gte',
+      value: 810,
+      unit: 'mm',
+    },
+    transcribed_from: { printed_page: '9-12', pdf_page: 842 },
+    required_action: 'Widen the door to at least 810 mm where it serves a required entrance, vestibule, entrance hall, stair or the line of passage to the basement.',
+    precision: null,
+    precision_measured_at: null,
+  },
+  {
+    id: 'door-width-rooms',
+    title: 'Doorway opening sizes, other rooms and balconies',
+    clause_ids: ['9.5.5.1.(1)'],
+    applies_when: { code_part: '9', predicate: 'door_serves_room_or_balcony' },
+    test: {
+      kind: 'numeric',
+      fact_kind: 'door_width_mm',
+      operator: 'gte',
+      value: 760,
+      unit: 'mm',
+    },
+    transcribed_from: { printed_page: '9-12', pdf_page: 842 },
+    required_action: 'Widen the door to at least 760 mm.',
+    precision: null,
+    precision_measured_at: null,
+  },
+  {
+    id: 'door-width-bathroom',
+    title: 'Doorway opening sizes, bathrooms and walk-in closets',
+    clause_ids: ['9.5.5.1.(1)'],
+    applies_when: { code_part: '9', predicate: 'door_serves_bathroom_or_closet' },
+    test: {
+      kind: 'numeric',
+      fact_kind: 'door_width_mm',
+      operator: 'gte',
+      value: 610,
+      unit: 'mm',
+    },
+    transcribed_from: { printed_page: '9-12', pdf_page: 842 },
+    required_action: 'Widen the door to at least 610 mm.',
+    precision: null,
+    precision_measured_at: null,
+  },
+  {
+    id: 'door-height',
+    title: 'Doorway opening height',
+    clause_ids: ['9.5.5.1.(1)'],
+    applies_when: { code_part: '9' },
+    test: {
+      kind: 'numeric',
+      fact_kind: 'door_height_mm',
+      operator: 'gte',
+      value: 1980,
+      unit: 'mm',
+    },
+    transcribed_from: { printed_page: '9-12', pdf_page: 842 },
+    required_action: 'Raise the doorway opening height to at least 1 980 mm.',
+    precision: null,
+    precision_measured_at: null,
+  },
+  {
+    id: 'stair-risers',
+    title: 'Dimensions for risers, private stairs',
+    clause_ids: ['9.8.4.1.(1)'],
+    applies_when: { code_part: '9', predicate: 'stair_is_private' },
+    test: {
+      kind: 'numeric',
+      fact_kind: 'riser_height_mm',
+      operator: 'between',
+      value: 125,
+      value_max: 200,
+      unit: 'mm',
+    },
+    transcribed_from: { printed_page: '9-22', pdf_page: 852 },
+    required_action: 'Adjust the riser height into the 125 to 200 mm range for a private stair.',
+    precision: null,
+    precision_measured_at: null,
+  },
+  {
+    id: 'stair-runs',
+    title: 'Dimensions for rectangular treads, private stairs',
+    clause_ids: ['9.8.4.2.(1)'],
+    applies_when: { code_part: '9', predicate: 'stair_is_private' },
+    test: {
+      kind: 'numeric',
+      fact_kind: 'tread_run_mm',
+      operator: 'between',
+      value: 255,
+      value_max: 355,
+      unit: 'mm',
+    },
+    transcribed_from: { printed_page: '9-23', pdf_page: 853 },
+    required_action: 'Adjust the tread run into the 255 to 355 mm range for a private stair.',
+    precision: null,
+    precision_measured_at: null,
+  },
+  {
+    id: 'stair-consistency',
+    // §6 gives this rule no clause: it is an internal cross-sheet check that
+    // yields drawing_conflict, not a code contravention.
+    title: 'Riser count agrees across plan and section',
+    clause_ids: ['9.8.4.1.(1)'],
+    applies_when: { code_part: '9' },
+    // Arithmetic, not judgment: 16 on the plan against 17 on the section is a
+    // comparison, so §G4 keeps it in code and no model is involved.
+    test: { kind: 'consistency', fact_kind: 'riser_count', across: 'sheets' },
+    transcribed_from: { printed_page: '9-22', pdf_page: 852 },
+    required_action: 'Correct one sheet so the riser counts match.',
+    precision: null,
+    precision_measured_at: null,
+  },
+  {
+    id: 'ceiling-height',
+    title: 'Ceiling heights of rooms or spaces',
+    clause_ids: ['9.5.3.1.(1)'],
+    applies_when: { code_part: '9' },
+    test: {
+      kind: 'numeric',
+      fact_kind: 'ceiling_height_mm',
+      operator: 'gte',
+      value: 2100,
+      unit: 'mm',
+    },
+    transcribed_from: { printed_page: '9-11', pdf_page: 841 },
+    required_action: 'Provide at least 2.1 m clear ceiling height over the required area.',
+    precision: null,
+    precision_measured_at: null,
+  },
+  {
+    id: 'bedroom-egress-area',
+    title: 'Egress window clear opening area',
+    clause_ids: ['9.9.10.1.(1)', '9.9.10.1.(2)'],
+    applies_when: { code_part: '9', predicate: 'not_sprinklered' },
+    test: {
+      kind: 'numeric',
+      fact_kind: 'egress_window_area_m2',
+      operator: 'gte',
+      value: 0.35,
+      unit: 'm2',
+    },
+    transcribed_from: { printed_page: '9-43', pdf_page: 873 },
+    required_action: 'Provide an openable window of at least 0.35 m2 clear opening in each bedroom.',
+    precision: null,
+    precision_measured_at: null,
+  },
+  {
+    id: 'bedroom-egress-dimension',
+    title: 'Egress window minimum dimension',
+    clause_ids: ['9.9.10.1.(2)'],
+    applies_when: { code_part: '9', predicate: 'not_sprinklered' },
+    test: {
+      kind: 'numeric',
+      fact_kind: 'egress_window_min_dimension_mm',
+      operator: 'gte',
+      value: 380,
+      unit: 'mm',
+    },
+    transcribed_from: { printed_page: '9-43', pdf_page: 873 },
+    required_action: 'Ensure no clear opening dimension is less than 380 mm.',
+    precision: null,
+    precision_measured_at: null,
+  },
+  {
+    id: 'spatial-separation',
+    title: 'Limiting distance, rating and cladding',
+    clause_ids: ['9.10.15.4.(1)', '9.10.15.5.(2)'],
+    applies_when: { code_part: '9' },
+    test: {
+      kind: 'presence',
+      fact_kinds: ['limiting_distance_m', 'exposing_wall_rating_min', 'glazing_area_ratio'],
+    },
+    transcribed_from: { printed_page: '9-71', pdf_page: 901 },
+    required_action: 'State the limiting distance per face, the wall assembly rating, the cladding and the permitted glazing area.',
+    precision: null,
+    precision_measured_at: null,
+  },
+  {
+    id: 'garage-separation',
+    title: 'Garage to dwelling air barrier and door',
+    clause_ids: ['9.10.9.18.(4)', '9.10.13.15.(1)'],
+    applies_when: { code_part: '9', predicate: 'has_storage_garage' },
+    test: { kind: 'presence', fact_kinds: ['garage_air_barrier', 'garage_door_spec'] },
+    transcribed_from: { printed_page: '9-57', pdf_page: 887 },
+    required_action: 'Specify the air barrier between garage and dwelling, and a self-closing, weather-stripped door that does not open into a sleeping room.',
+    precision: null,
+    precision_measured_at: null,
+  },
+  {
+    id: 'smoke-alarms',
+    title: 'Smoke alarm locations',
+    clause_ids: ['9.10.19.1.(1)', '9.10.19.3.(1)'],
+    applies_when: { code_part: '9' },
+    test: { kind: 'presence', fact_kinds: ['smoke_alarm_location'] },
+    transcribed_from: { printed_page: '9-79', pdf_page: 909 },
+    required_action: 'Show a smoke alarm on every storey, in each sleeping room, and in the hall serving the sleeping rooms.',
+    precision: null,
+    precision_measured_at: null,
+  },
+  {
+    id: 'co-alarms',
+    title: 'Carbon monoxide alarm locations',
+    clause_ids: ['9.32.3.9.(1)'],
+    applies_when: { code_part: '9', predicate: 'has_garage_or_fuel_appliance' },
+    test: { kind: 'presence', fact_kinds: ['co_alarm_location'] },
+    transcribed_from: { printed_page: '9-219', pdf_page: 1049 },
+    required_action: 'Show carbon monoxide alarms where a storage garage or fuel-burning appliance is present.',
+    precision: null,
+    precision_measured_at: null,
+  },
+  {
+    id: 'energy-tier',
+    title: 'Section 9.36 compliance path and Tier 1 data',
+    clause_ids: ['9.36.1.3.(1)'],
+    applies_when: { code_part: '9' },
+    test: {
+      kind: 'presence',
+      fact_kinds: ['energy_compliance_path', 'assembly_rsi', 'window_performance'],
+    },
+    transcribed_from: { printed_page: '9-239', pdf_page: 1069 },
+    required_action: 'State the Section 9.36 compliance path and the Tier 1 assembly and window performance values.',
+    precision: null,
+    precision_measured_at: null,
+  },
+];
+
+export function ruleById(id: string): Rule | undefined {
+  return PART9_RULES.find((r) => r.id === id);
+}

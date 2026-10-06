@@ -4,15 +4,8 @@ import { parsePdf } from '@/lib/parsers/pdf';
 import { parseImage } from '@/lib/parsers/image';
 import { parseDxf, DwgUnsupportedError } from '@/lib/parsers/dxf';
 import { extractSheetFromImage, mergeExtraction, delay } from '@/lib/extract';
-import {
-  compliancePass,
-  consistencyPass,
-  dedupeViolations,
-  ruleEnginePass,
-  sheetHasUsableData,
-} from '@/lib/analyze';
-import { countCodeChunks } from '@/lib/retrieve';
-import { resolveBuildingPart } from '@/lib/occupancy-resolve';
+import { dedupeViolations, ruleEnginePass, sheetHasUsableData } from '@/lib/analyze';
+import { detectBuildingPart } from '@/lib/rule-engine/occupancy';
 import { emptyAnnotations, isDiagnosticMarker } from '@/lib/annotations';
 import { emptyExtractedSheet, type AnalysisResult, type ExtractedSheet, type FileType, type Violation } from '@/lib/types';
 
@@ -168,16 +161,7 @@ export async function POST(req: NextRequest) {
   }
 
   // eslint-disable-next-line no-console
-  console.log('[analyze] running compliance pass');
-  const chunkCount = await countCodeChunks();
-  if (chunkCount === 0) {
-    warnings.push(
-      'building_code_chunks table is empty — ingest a code PDF (npm run ingest <pdf>) before compliance can cite sections',
-    );
-  } else if (chunkCount < 0) {
-    warnings.push('could not verify building_code_chunks table — compliance results may be degraded');
-  }
-
+  console.log('[analyze] running deterministic rule engine');
   const allViolations: Violation[] = [];
   for (const sheet of sheets) {
     if (!sheetHasUsableData(sheet)) {
@@ -185,21 +169,20 @@ export async function POST(req: NextRequest) {
       continue;
     }
 
-    // Resolve which NBC Part governs this sheet once, so the deterministic
-    // engine and the LLM pass cannot disagree. The sheet's own text wins; Jev is
-    // consulted only when it is silent, and only above a high confidence bar.
-    const resolvedPart = await resolveBuildingPart(sheet);
-    if (resolvedPart.note) {
-      warnings.push(`${sheet.sheet_name}: ${resolvedPart.note}`);
+    // Which NBC Part governs this sheet, read off the sheet's own stated
+    // occupancy. Undefined when the drawings do not say; PLANQ_SPEC.md §S1
+    // replaces this with a Haiku applicability stage that stops the run rather
+    // than guessing.
+    const buildingPart = detectBuildingPart(sheet.occupancy_type, sheet.building_type);
+    if (!buildingPart) {
+      warnings.push(
+        `${sheet.sheet_name}: occupancy not stated on the sheet — Part 9 vs Part 3 unresolved, part-specific checks skipped`,
+      );
     }
 
-    // Deterministic rule engine first — exact, instant, no model call. Records
-    // which sections it covered so the LLM pass below can be deduped against it.
-    let coveredSections = new Set<string>();
     try {
-      const ruleOut = await ruleEnginePass(sheet, { buildingPart: resolvedPart.part });
+      const ruleOut = await ruleEnginePass(sheet, { buildingPart });
       allViolations.push(...ruleOut.violations);
-      coveredSections = ruleOut.coveredSections;
       // Say what the guardrails threw away, so "no violations" is never
       // indistinguishable from "nothing was measurable".
       for (const note of ruleOut.skipped.slice(0, 8)) {
@@ -225,52 +208,7 @@ export async function POST(req: NextRequest) {
       console.error('[analyze] rule engine error', err);
     }
 
-    if (chunkCount === 0) continue;
-    try {
-      // compliancePass dedupes against the rule engine's sections, tags the
-      // survivors as LLM-sourced, and runs them through the TypeSafe (Jev)
-      // verification gate before returning.
-      const { violations: llmViolations, dropped } = await compliancePass(sheet, {
-        coveredSections,
-        buildingPart: resolvedPart.part,
-      });
-      allViolations.push(...llmViolations);
-
-      // A finding the gate removed is reported, never silently dropped.
-      for (const d of dropped) {
-        warnings.push(
-          `${sheet.sheet_name}: discarded unverifiable finding — ${d.violation.description} (${d.verification.verdict}: ${d.verification.note ?? 'no reason given'})`,
-        );
-      }
-      // Surviving findings the gate could not fully stand behind are flagged so
-      // a reviewer knows which ones still need a human.
-      for (const v of llmViolations) {
-        const ver = v.verification;
-        if (!ver || ver.verdict === 'verified') continue;
-        warnings.push(
-          `${sheet.sheet_name}: finding needs review (${ver.verdict}) — ${v.description}${ver.note ? ` [${ver.note}]` : ''}`,
-        );
-      }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      warnings.push(`compliance pass failed for ${sheet.sheet_name}: ${msg}`);
-      // eslint-disable-next-line no-console
-      console.error('[analyze] compliance pass error', err);
-    }
     await delay(500);
-  }
-
-  // eslint-disable-next-line no-console
-  console.log('[analyze] running consistency pass');
-  try {
-    const consistency = await consistencyPass(sheets);
-    for (const cv of consistency) cv.source = 'llm';
-    allViolations.push(...consistency);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    warnings.push(`consistency pass failed: ${msg}`);
-    // eslint-disable-next-line no-console
-    console.error('[analyze] consistency pass error', err);
   }
 
   // One physical element measured on several pages must not read as several
@@ -288,7 +226,6 @@ export async function POST(req: NextRequest) {
       affected_sheets: v.affected_sheets ?? null,
       location_hint: v.location_hint ?? null,
       source: v.source ?? null,
-      verification: v.verification ?? null,
     }));
     const { error: vErr } = await supabaseAdmin.from('violations').insert(rows);
     if (vErr) {
