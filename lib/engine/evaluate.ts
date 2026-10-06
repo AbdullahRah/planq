@@ -80,7 +80,7 @@ function applicability(
   rule: Rule,
   app: Applicability,
   predicates: Record<string, boolean | undefined>,
-): { applies: boolean; reason?: string } {
+): { applies: boolean; reason?: string; unresolved?: string } {
   const when = rule.applies_when;
   if (when.code_part && !app.code_parts.includes(when.code_part)) {
     return {
@@ -100,9 +100,17 @@ function applicability(
       return { applies: false, reason: `predicate ${when.predicate} is false for this building` };
     }
     if (v === undefined) {
-      // Unresolved predicate is not the same as inapplicable: the rule still
-      // runs, and a missing fact will land it on cant_determine (§G5).
-      return { applies: true, reason: `predicate ${when.predicate} unresolved` };
+      // An unresolved predicate must not produce a verdict.
+      //
+      // This previously let the rule run, on the reasoning that a missing fact
+      // would land it on cant_determine anyway. That was wrong, and it showed:
+      // door-width-entrance requires its 810 mm threshold only for a door
+      // serving a required entrance or stair, so with the predicate unresolved
+      // every 800 mm bathroom and closet door in the set was reported as 10 mm
+      // short of a requirement that does not apply to it. A rule whose scope is
+      // unknown yields cant_determine for the facts it would have judged, which
+      // is what §G5 means by absence not being a result.
+      return { applies: true, unresolved: when.predicate };
     }
   }
   return { applies: true };
@@ -143,6 +151,7 @@ export function evaluate(input: EvaluateInput): EvaluateOutput {
       skipped.push({ rule_id: rule.id, reason: scope.reason ?? 'not applicable' });
       continue;
     }
+    const unresolved = scope.unresolved;
 
     const base = {
       rule_id: rule.id,
@@ -187,7 +196,7 @@ export function evaluate(input: EvaluateInput): EvaluateOutput {
       findings.push({
         ...base,
         id: nextId(),
-        status: 'pass',
+        status: unresolved ? 'cant_determine' : 'pass',
         summary: `${rule.title}: the required information is stated on the drawings.`,
         fact_ids: supporting.map((f) => f.id),
         computed: { stated: required.join(', ') },
@@ -196,7 +205,64 @@ export function evaluate(input: EvaluateInput): EvaluateOutput {
       continue;
     }
 
+    // ---- consistency: the same measurement across sheets must agree -------
+    if (rule.test.kind === 'consistency') {
+      const relevant = facts.filter((f) => rule.test.kind === 'consistency' && f.kind === rule.test.fact_kind);
+      const bySheet = new Map<string, typeof relevant>();
+      for (const f of relevant) {
+        const key = f.provenance === 'drawing_text' ? f.sheet : (f.container ?? 'ifc');
+        const list = bySheet.get(key);
+        if (list) list.push(f);
+        else bySheet.set(key, [f]);
+      }
+
+      if (bySheet.size < 2) {
+        // One sheet cannot disagree with itself. §G5: that is not a pass.
+        findings.push({
+          ...base,
+          id: nextId(),
+          status: 'cant_determine',
+          summary: `${rule.title}: the measurement appears on ${bySheet.size} sheet(s), so it cannot be cross-checked.`,
+          fact_ids: relevant.map((f) => f.id),
+          computed: { sheets: [...bySheet.keys()].join(', ') || 'none' },
+          drawing_reference: drawingRef(relevant),
+        });
+        continue;
+      }
+
+      const values = [...bySheet.entries()].map(([sheet, fs]) => ({
+        sheet,
+        value: typeof fs[0].value === 'number' ? fs[0].value : NaN,
+        fact: fs[0],
+      }));
+      const distinct = new Set(values.map((v) => v.value));
+
+      if (distinct.size > 1) {
+        findings.push({
+          ...base,
+          id: nextId(),
+          status: 'drawing_conflict',
+          summary: `${rule.title}: ${values.map((v) => `sheet ${v.sheet} shows ${v.value}`).join(', ')}. The sheets disagree.`,
+          fact_ids: values.map((v) => v.fact.id),
+          computed: Object.fromEntries(values.map((v) => [`sheet_${v.sheet}`, v.value])),
+          drawing_reference: values.map((v) => `Sheet ${v.sheet}`).join(', '),
+        });
+      } else {
+        findings.push({
+          ...base,
+          id: nextId(),
+          status: 'pass',
+          summary: `${rule.title}: every sheet shows ${[...distinct][0]}.`,
+          fact_ids: values.map((v) => v.fact.id),
+          computed: { agreed: [...distinct][0] },
+          drawing_reference: values.map((v) => `Sheet ${v.sheet}`).join(', '),
+        });
+      }
+      continue;
+    }
+
     // ---- numeric: the arithmetic case, §G4 --------------------------------
+    if (rule.test.kind !== 'numeric') continue;
     const test = rule.test;
     const candidates = facts.filter((f) => f.kind === test.fact_kind);
 
@@ -219,6 +285,26 @@ export function evaluate(input: EvaluateInput): EvaluateOutput {
     }
 
     for (const fact of candidates) {
+      // Scope unknown: record what was measured and what the threshold would be,
+      // and let a reviewer or the S2 pass settle whether the rule applies.
+      if (unresolved) {
+        const value = factNumber(fact, test.unit);
+        findings.push({
+          ...base,
+          id: nextId(),
+          status: 'cant_determine',
+          summary: `${rule.title}: ${subjectOf(fact)} is ${value == null ? fact.source_text : `${round(value)} ${test.unit}`}, but whether this rule applies depends on ${unresolved.replace(/_/g, ' ')}, which the drawings do not establish.`,
+          fact_ids: [fact.id],
+          computed: {
+            measured: value == null ? String(fact.value) : round(value),
+            required_if_applicable: `${test.value}${test.value_max != null ? ` to ${test.value_max}` : ''} ${test.unit}`,
+            unresolved,
+          },
+          drawing_reference: drawingRef([fact]),
+        });
+        continue;
+      }
+
       const value = factNumber(fact, test.unit);
       if (value == null) {
         findings.push({

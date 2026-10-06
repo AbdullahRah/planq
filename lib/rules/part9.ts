@@ -161,7 +161,9 @@ export const PART9_RULES: Rule[] = [
     title: 'Riser count agrees across plan and section',
     clause_ids: ['9.8.4.1.(1)'],
     applies_when: { code_part: '9' },
-    test: { kind: 'judgment', question: 'riser_count_consistent', fact_kinds: ['riser_count'] },
+    // Arithmetic, not judgment: 16 on the plan against 17 on the section is a
+    // comparison, so §G4 keeps it in code and no model is involved.
+    test: { kind: 'consistency', fact_kind: 'riser_count', across: 'sheets' },
     transcribed_from: { printed_page: '9-22', pdf_page: 852 },
     required_action: 'Correct one sheet so the riser counts match.',
     precision: null,

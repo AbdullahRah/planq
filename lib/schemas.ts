@@ -200,6 +200,21 @@ export const JudgmentTestSchema = z.object({
   fact_kinds: z.array(z.string()),
 });
 
+/**
+ * Two or more facts of the same kind that must agree across sheets.
+ *
+ * This was a judgment test, which was wrong: comparing a riser count of 16 on
+ * the plan with 17 on the section is arithmetic, and §G4 says arithmetic runs
+ * in code. Asking a model whether two numbers differ adds cost, latency and a
+ * failure mode in exchange for nothing.
+ */
+export const ConsistencyTestSchema = z.object({
+  kind: z.literal('consistency'),
+  fact_kind: z.string(),
+  /** Facts are only compared when they come from different sheets. */
+  across: z.literal('sheets'),
+});
+
 export const PresenceTestSchema = z.object({
   kind: z.literal('presence'),
   /** Facts that must exist for a pass. Absence is cant_determine, never a pass (§G5). */
@@ -210,6 +225,7 @@ export const RuleTestSchema = z.discriminatedUnion('kind', [
   NumericTestSchema,
   JudgmentTestSchema,
   PresenceTestSchema,
+  ConsistencyTestSchema,
 ]);
 
 export const RuleSchema = z.object({
