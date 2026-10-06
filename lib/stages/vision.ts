@@ -19,12 +19,13 @@
 
 import { z } from 'zod';
 import type { Fact, NegativeEvidence, Rule } from '../schemas';
+import { classifySpace, SPACE_CLASSES } from '../engine/spaces';
 import type { Conventions } from '../intake/legend';
 import type { SheetInventory } from '../intake/sheets';
 import { renderSheet, type RenderedSheet } from '../intake/render';
 import { runStage, type ContentBlock, type RunLedger } from './runner';
 
-const PROMPT_VERSION = 's2-2026-10-05';
+const PROMPT_VERSION = 's2-2026-10-06';
 
 /**
  * A count printed with its marker, such as "12R" for twelve risers, comes back
@@ -43,6 +44,8 @@ const ObservedFactSchema = z.object({
   value: z.union([z.number(), z.string(), z.boolean()]),
   unit: z.string().nullable(),
   subject: z.string(),
+  /** What space the element serves; drives which space-specific rule applies. */
+  space: z.enum(SPACE_CLASSES),
   source_text: z.string().min(1),
   /** Tile-relative pixel box, converted to sheet points by the caller. */
   bbox: z.array(z.number()).length(4),
@@ -76,12 +79,13 @@ const VISION_JSON_SCHEMA = {
           value: { type: ['number', 'string', 'boolean'] },
           unit: { type: ['string', 'null'] },
           subject: { type: 'string' },
+          space: { type: 'string', enum: [...SPACE_CLASSES] },
           source_text: { type: 'string' },
           bbox: { type: 'array', items: { type: 'number' } },
           tile_id: { type: 'string' },
           confidence: { type: 'number' },
         },
-        required: ['kind', 'value', 'unit', 'subject', 'source_text', 'bbox', 'tile_id', 'confidence'],
+        required: ['kind', 'value', 'unit', 'subject', 'space', 'source_text', 'bbox', 'tile_id', 'confidence'],
       },
     },
     not_found: {
@@ -113,13 +117,15 @@ Absolute rules:
 6. subject says what the value belongs to, using the sheet's own room or element label, for example "P2 door at entrance hall" or "guard at rooftop terrace".
 7. confidence is how sure you are that you read the characters correctly, from 0 to 1. Lower it when text is small, rotated or partly cut off.
 8. For every requested fact kind you could not find, add an entry to not_found naming where you looked, for example "door schedule", "section A", "general notes". An absence recorded this way is useful; a guess is not.
-9. Do not infer one fact from another. If a section shows a floor level and a ceiling level, report both level marks as they are printed. Do not subtract them to produce a height.
+9. space classifies what the element serves, judged from the plan around it rather than from any one word, in whatever language the sheet uses: a door is classed by the room it opens into (the door into a bathroom is "bathroom", the front door or a door off the entrance hall is "entrance", a door at the top or foot of a stair is "stair"); a guard or level by the surface it is on ("roof" for a roof terrace or rooftop, "balcony" for a deck or balcony). A reach-in closet is "closet" and a walk-in closet is "walk_in_closet". Use "unknown" when the drawing does not make it clear; do not guess.
+10. Do not infer one fact from another. If a section shows a floor level and a ceiling level, report both level marks as they are printed. Do not subtract them to produce a height.
 
 Return only JSON matching the schema.`;
 
 /** What the rule set needs, phrased for a reader rather than as field names. */
 const KIND_DESCRIPTIONS: Record<string, string> = {
-  guard_height_mm: 'the height of a guard, railing or parapet, where printed',
+  guard_height_mm:
+    'the height of a guard, railing, balustrade or parapet at a roof terrace, balcony, deck, landing or stair. In sections and elevations this is often an UNLABELLED dimension string beside the top of a parapet or rail, between the walking surface level mark and the top of the guard (for example "0.50 m" next to a rooftop level). Report that printed dimension; subject names where the guard is',
   guard_opening_mm: 'the spacing or opening size in a guard or railing infill',
   door_width_mm: 'door widths, from tags, schedules or dimension strings',
   door_height_mm: 'door heights',
@@ -279,6 +285,9 @@ export async function extractSheetByVision(
       value: f.value,
       unit: f.unit ?? undefined,
       subject: f.subject,
+      // The model sees the plan, so its class wins; the keyword fallback only
+      // fills in when it could not tell.
+      space: f.space !== 'unknown' ? f.space : classifySpace(f.subject),
       provenance: 'drawing_text',
       sheet: sheet.number,
       tile: f.tile_id,

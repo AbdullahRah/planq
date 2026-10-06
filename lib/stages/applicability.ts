@@ -328,9 +328,6 @@ export async function determineApplicability(
           ? undefined
           : false,
     not_sprinklered: obs.sprinklered == null ? undefined : !obs.sprinklered,
-    // Which doors serve a required entrance or stair is a per-door question the
-    // vision pass answers, never a whole-building one.
-    door_serves_entrance_or_stair: undefined,
     stair_is_private: residential ? true : undefined,
   };
 

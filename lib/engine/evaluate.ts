@@ -27,6 +27,7 @@ import type {
 } from '../schemas';
 import { mayDisplayFail } from '../schemas';
 import { convert, UnitMismatchError } from './units';
+import type { SpaceClass } from './spaces';
 
 export interface EvaluateInput {
   rules: Rule[];
@@ -73,6 +74,30 @@ function compare(
     default:
       return false;
   }
+}
+
+/**
+ * Does a space-specific rule judge this fact? "unknown" means the fact's space
+ * was not established and the rule names the spaces it covers, so judging it
+ * would assume what the drawings did not say.
+ */
+function spaceScope(rule: Rule, fact: Fact): 'match' | 'excluded' | 'unknown' {
+  const sel = rule.applies_when.fact_space;
+  if (!sel) return 'match';
+  const space: SpaceClass = fact.space ?? 'unknown';
+  if (sel.not_in?.includes(space)) return 'excluded';
+  if (!sel.in) return 'match';
+  if (space === 'unknown') return 'unknown';
+  return sel.in.includes(space) ? 'match' : 'excluded';
+}
+
+function thresholdText(t: { value: number; value_max?: number; unit: string }): string {
+  return `${t.value}${t.value_max != null ? ` to ${t.value_max}` : ''} ${t.unit}`;
+}
+
+/** "door width" from "door_width_mm", for sentences. */
+function noun(kind: string): string {
+  return kind.replace(/_mm$|_m2$|_m$|_min$/, '').replace(/_/g, ' ');
 }
 
 /** Does this rule apply to this building at all? */
@@ -279,9 +304,19 @@ export function evaluate(input: EvaluateInput): EvaluateOutput {
     // ---- numeric: the arithmetic case, §G4 --------------------------------
     if (rule.test.kind !== 'numeric') continue;
     const test = rule.test;
-    const candidates = facts.filter((f) => f.kind === test.fact_kind);
+    const ofKind = facts.filter((f) => f.kind === test.fact_kind);
+    // A grouped rule leaves facts of unknown space to the group pass below, so
+    // one door is reported once rather than once per threshold.
+    const candidates = ofKind.filter((f) => {
+      const sc = spaceScope(rule, f);
+      return sc === 'match' || (sc === 'unknown' && !rule.scope_group);
+    });
 
-    if (candidates.length === 0) {
+    // Within a group only the first rule reports that nothing was found;
+    // otherwise "no door width shown" appeared three times.
+    const groupLead = !rule.scope_group || rules.find((r) => r.scope_group === rule.scope_group)?.id === rule.id;
+
+    if (ofKind.length === 0 && groupLead) {
       // §G5: nothing measured is cant_determine, not pass.
       const neg = negByRule.get(rule.id);
       findings.push({
@@ -302,7 +337,10 @@ export function evaluate(input: EvaluateInput): EvaluateOutput {
     for (const fact of candidates) {
       // Scope unknown: record what was measured and what the threshold would be,
       // and let a reviewer or the S2 pass settle whether the rule applies.
-      if (unresolved) {
+      const factUnresolved =
+        unresolved ?? (spaceScope(rule, fact) === 'unknown' ? 'which space this serves' : undefined);
+      if (factUnresolved) {
+        const unresolved = factUnresolved;
         const value = factNumber(fact, test.unit);
         findings.push({
           ...base,
@@ -369,7 +407,112 @@ export function evaluate(input: EvaluateInput): EvaluateOutput {
     }
   }
 
-  return { findings, pending_judgment, skipped };
+  // ---- scope groups: one finding per element whose space is unknown -------
+  const groups = new Map<string, Rule[]>();
+  for (const r of rules) {
+    if (!r.scope_group || r.test.kind !== 'numeric') continue;
+    if (!applicability(r, app, predicates).applies) continue;
+    const list = groups.get(r.scope_group);
+    if (list) list.push(r);
+    else groups.set(r.scope_group, [r]);
+  }
+  for (const group of groups.values()) {
+    const tests = group.map((r) => ({ rule: r, test: r.test as Extract<Rule['test'], { kind: 'numeric' }> }));
+    const kind = tests[0].test.fact_kind;
+    const unit = tests[0].test.unit;
+    // Ordered loosest to strictest, which for these minimums is by value.
+    const byStrictness = [...tests].sort((a, b) => a.test.value - b.test.value);
+    const loosest = byStrictness[0];
+    const strictest = byStrictness[byStrictness.length - 1];
+    const options = byStrictness.map((t) => `${thresholdText(t.test)} (${t.rule.title.replace(/^[^,]*,\s*/, '')})`).join('; ');
+
+    for (const fact of facts.filter((f) => f.kind === kind)) {
+      if (!tests.every((t) => spaceScope(t.rule, fact) === 'unknown')) continue;
+      const value = factNumber(fact, unit);
+      const groupBase = {
+        clause_ids: [...new Set(group.flatMap((r) => r.clause_ids))],
+        clause_quotes: [] as string[],
+        verifier: 'not_run' as const,
+        reviewer_state: 'unreviewed' as const,
+        evidence_crops: [] as string[],
+        fact_ids: [fact.id],
+        drawing_reference: drawingRef([fact]),
+      };
+      const allMinimums = tests.every((t) => t.test.operator === 'gte');
+
+      if (value != null && allMinimums && compare(value, strictest.test)) {
+        findings.push({
+          ...groupBase,
+          rule_id: strictest.rule.id,
+          id: nextId(),
+          status: 'pass',
+          summary: `${subjectOf(fact)} is ${round(value)} ${unit}, which meets ${thresholdText(strictest.test)}, the largest ${noun(kind)} required for any space, so it complies whatever it serves.`,
+          computed: { measured: round(value), required: thresholdText(strictest.test) },
+          required_action: strictest.rule.required_action,
+        });
+        continue;
+      }
+
+      if (value != null && allMinimums && !compare(value, loosest.test)) {
+        // Short of even the smallest requirement, so it fails whatever it serves.
+        const status: FindingStatus = fact.stable ? 'fail' : 'needs_confirmation';
+        findings.push({
+          ...groupBase,
+          rule_id: loosest.rule.id,
+          id: nextId(),
+          status: gate(status, loosest.rule),
+          summary: `${subjectOf(fact)} is ${round(value)} ${unit}, below ${thresholdText(loosest.test)}, the smallest ${noun(kind)} required for any space.`,
+          computed: {
+            measured: round(value),
+            required: thresholdText(loosest.test),
+            shortfall: round(loosest.test.value - value),
+            ...(fact.stable ? {} : { stability: 'fact appeared in only one extraction run' }),
+          },
+          required_action: loosest.rule.required_action,
+        });
+        continue;
+      }
+
+      findings.push({
+        ...groupBase,
+        rule_id: strictest.rule.id,
+        id: nextId(),
+        status: 'cant_determine',
+        summary: `${subjectOf(fact)} is ${value == null ? `"${fact.source_text}"` : `${round(value)} ${unit}`}. The requirement depends on what it serves, which the drawings do not establish: ${options}.`,
+        computed: {
+          measured: value == null ? String(fact.value) : round(value),
+          could_require: options,
+        },
+        required_action: `Label the room or space this ${noun(kind).replace(/ width| height/, '')} serves, on the plan or in a schedule, so the applicable ${noun(kind)} can be checked.`,
+      });
+    }
+  }
+
+  // ---- what the finding asks the reader to do -----------------------------
+  // A pass asks nothing. A cant_determine asks for the missing information, not
+  // for a change to the building: "widen the door to 610 mm" on an 800 mm door
+  // whose room was unknown read as nonsense.
+  const ruleMap = new Map(rules.map((r) => [r.id, r]));
+  const withActions = findings.map((f) => {
+    const rule = ruleMap.get(f.rule_id);
+    if (f.status === 'pass') return { ...f, required_action: '' };
+    if (f.status === 'cant_determine' && rule && f.required_action === rule.required_action) {
+      const what =
+        rule.test.kind === 'numeric' || rule.test.kind === 'consistency'
+          ? noun(rule.test.fact_kind)
+          : rule.title.toLowerCase();
+      return {
+        ...f,
+        required_action:
+          typeof f.computed.unresolved === 'string'
+            ? `Show what this element serves so it is clear whether the ${what} requirement applies.`
+            : (rule.missing_action ?? `Show the ${what} on the drawings so it can be checked.`),
+      };
+    }
+    return f;
+  });
+
+  return { findings: withActions, pending_judgment, skipped };
 }
 
 function round(n: number): number {

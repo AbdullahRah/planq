@@ -14,6 +14,7 @@
 
 import type { DrawingFact, Fact } from '../schemas';
 import type { SheetInventory, SheetTextItem } from './sheets';
+import { classifySpace } from '../engine/spaces';
 
 /** "0.80 m" / "1.10 m" / "810 mm" / "2.60m" */
 const DIM_RE = /^(\d+(?:[.,]\d+)?)\s*(mm|cm|m)\b/i;
@@ -69,6 +70,9 @@ function drawing(
 ): DrawingFact {
   return {
     ...f,
+    // The text layer has no model to say what a door serves, so the room label
+    // printed next to it is classified by keyword. Unmatched stays unknown.
+    space: f.space ?? classifySpace(f.subject),
     provenance: 'drawing_text',
     tile: f.tile ?? `${f.sheet}-native`,
     run: 1,
