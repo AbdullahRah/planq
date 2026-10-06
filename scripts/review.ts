@@ -28,48 +28,86 @@ loadEnv({ path: path.resolve(process.cwd(), '.env.local') });
 /**
  * Storey count and building area off the sheet's own area schedule.
  *
- * Deliberately narrow: it reads the printed "TOTAL M2 OF CONSTRUCTION" style
- * schedule and counts the floor labels. When the sheet does not carry one it
- * returns null and the run stops, because §1.3.3.3.(1) turns on building area
- * and storeys and guessing either decides which Part governs.
+ * The distinction that matters here is building area versus total floor area.
+ * Division A 1.3.3.3.(1) applies Part 9 below 600 m2 of BUILDING area, which is
+ * the footprint - the greatest horizontal area of a storey - not the sum across
+ * storeys. The Chesnut schedule prints both: GROUND FLOOR 87.82 m2 and FIRST
+ * LEVEL 122.33 m2 per storey, TOTAL M2 OF CONSTRUCTION 268.33 m2 across them.
+ * Feeding 268.33 into a 600 m2 test would push a large house out of Part 9 and
+ * into Part 3, changing every rule that then runs.
+ *
+ * Values are matched by position, not by reading order: the schedule prints its
+ * label and figure side by side, and the PDF's item order interleaves them with
+ * unrelated title-block text.
  */
 function readAreaSchedule(sheets: SheetInventory[]): {
   storeys: number;
-  area_m2: number;
+  /** Footprint, for 1.3.3.3.(1). */
+  building_area_m2: number;
+  /** Sum across storeys, reported but never compared against the Part 9 limit. */
+  total_floor_area_m2: number | null;
   occupancy: string;
   evidence: string;
 } | null {
-  const all = sheets.flatMap((s) => s.text_items.map((t) => t.text.trim()));
-  const joined = all.join(' ');
+  const AREA_RE = /^(\d{1,5}(?:[.,]\d+)?)\s*m[²2]$/i;
 
-  // "TOTAL M2 OF CONSTRUCTION:" followed by the figure, possibly a few items later.
-  const totalIdx = all.findIndex((t) => /TOTAL\s*M2\s*OF\s*CONSTRUCTION/i.test(t));
-  let area_m2: number | null = null;
-  if (totalIdx >= 0) {
-    for (const t of all.slice(totalIdx + 1, totalIdx + 8)) {
-      const m = t.match(/^(\d{2,5}(?:[.,]\d+)?)\s*(?:m2|M2)?$/);
-      if (m) {
-        area_m2 = Number(m[1].replace(',', '.'));
-        break;
-      }
+  /** The figure printed on the same line as a label, to its right. */
+  const valueFor = (sheet: SheetInventory, labelRe: RegExp): number | null => {
+    const label = sheet.text_items.find((t) => labelRe.test(t.text.trim()));
+    if (!label) return null;
+    const near = sheet.text_items
+      .filter(
+        (t) =>
+          t !== label &&
+          Math.abs(t.y - label.y) < 8 &&
+          t.x > label.x &&
+          t.x - label.x < 260 &&
+          AREA_RE.test(t.text.trim()),
+      )
+      .sort((a, b) => a.x - b.x)[0];
+    if (!near) return null;
+    return Number(near.text.trim().match(AREA_RE)![1].replace(',', '.'));
+  };
+
+  // Per-storey areas. A storey printed as 0.00 m2 is not a storey.
+  const STOREY_LABELS: Array<[string, RegExp]> = [
+    ['basement', /^BASEMENT\s*:?$/i],
+    ['ground floor', /^GROUND\s+FLOOR\s*:?$/i],
+    ['first level', /^FIRST\s+LEVEL\s*:?$/i],
+    ['second level', /^SECOND\s+LEVEL\s*:?$/i],
+    ['third level', /^THIRD\s+LEVEL\s*:?$/i],
+  ];
+
+  const storeyAreas: Array<{ name: string; area: number }> = [];
+  let total: number | null = null;
+
+  for (const sheet of sheets) {
+    for (const [name, re] of STOREY_LABELS) {
+      if (storeyAreas.some((s) => s.name === name)) continue;
+      const v = valueFor(sheet, re);
+      if (v != null) storeyAreas.push({ name, area: v });
     }
+    if (total == null) total = valueFor(sheet, /^TOTAL\s*M2\s*OF\s*CONSTRUCTION\s*:?$/i);
   }
-  if (area_m2 == null) return null;
 
-  // Storeys from the floor labels the schedule names.
-  const labels = ['GROUND FLOOR', 'FIRST LEVEL', 'SECOND LEVEL', 'THIRD LEVEL'];
-  const storeys = labels.filter((l) => new RegExp(l, 'i').test(joined)).length;
-  if (storeys === 0) return null;
+  const occupied = storeyAreas.filter((s) => s.area > 0);
+  if (occupied.length === 0) return null;
 
+  const building_area_m2 = Math.max(...occupied.map((s) => s.area));
+  const joined = sheets.flatMap((s) => s.text_items.map((t) => t.text)).join(' ');
   const residential = /bedroom|dwelling|residence|house/i.test(joined);
 
   return {
-    storeys,
-    area_m2,
+    storeys: occupied.length,
+    building_area_m2,
+    total_floor_area_m2: total,
     occupancy: residential
       ? 'Group C, residential (single dwelling unit)'
       : 'not stated on the sheets',
-    evidence: `TOTAL M2 OF CONSTRUCTION = ${area_m2} m2, ${storeys} storey label(s) in the area schedule`,
+    evidence:
+      `${occupied.map((s) => `${s.name} ${s.area} m2`).join(', ')}` +
+      `; building area (largest storey) ${building_area_m2} m2` +
+      (total != null ? `; total floor area ${total} m2, not used for 1.3.3.3.(1)` : ''),
   };
 }
 
@@ -131,7 +169,7 @@ async function main() {
   const applicability: Applicability = {
     major_occupancy: area.occupancy,
     storeys: area.storeys,
-    building_area_m2: area.area_m2,
+    building_area_m2: area.building_area_m2,
     code_parts: ['9'],
     edition: 'NBC(AE) 2023',
     energy_path: 'NBC_9.36',
@@ -140,7 +178,7 @@ async function main() {
     notes: [`read from the sheet area schedule: ${area.evidence}`],
   };
   console.log(
-    `\nS1 applicability (READ FROM SHEET, not yet judged by Haiku): Part ${applicability.code_parts.join(', ')}, ${applicability.energy_path}, ${applicability.storeys} storeys, ${applicability.building_area_m2} m2`,
+    `\nS1 applicability (READ FROM SHEET, not yet judged by Haiku): Part ${applicability.code_parts.join(', ')}, ${applicability.energy_path}, ${applicability.storeys} storeys, building area ${applicability.building_area_m2} m2`,
   );
   console.log(`   basis: ${area.evidence}`);
 
