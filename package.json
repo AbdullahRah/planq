@@ -18,11 +18,13 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.70.1",
     "@clerk/nextjs": "^6.39.5",
+    "@napi-rs/canvas": "^0.1.100",
     "@supabase/ssr": "^0.10.3",
     "@supabase/supabase-js": "^2.45.0",
     "dotenv": "^16.4.5",
     "next": "14.2.35",
     "pdf-to-png-converter": "^4.0.0",
+    "pdfjs-dist": "^5.7.284",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "sharp": "^0.33.5",

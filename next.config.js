@@ -20,10 +20,14 @@ const nextConfig = {
     // Rendering works locally because the file is present in node_modules, so
     // this only ever shows up once deployed. Trace it in explicitly. The clause
     // store is read with fs at a path built from process.cwd(), so it has the
-    // same problem.
+    // same problem. pdfjs also loads @napi-rs/canvas through createRequire to
+    // polyfill DOMMatrix, and without it fails with "DOMMatrix is not defined"
+    // before reading a single page; the canvas package in turn requires its
+    // platform binary by name.
     outputFileTracingIncludes: {
       '/api/analyze': [
         './node_modules/pdfjs-dist/legacy/build/pdf.worker.mjs',
+        './node_modules/@napi-rs/**',
         './data/code-store.json',
       ],
     },
