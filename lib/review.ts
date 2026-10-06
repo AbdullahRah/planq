@@ -15,7 +15,7 @@ import { randomUUID } from 'crypto';
 import { intake, intakeImage, type IntakeResult, type SheetInventory } from './intake/sheets';
 import { readConventions, type Conventions } from './intake/legend';
 import { extractNativeFacts } from './intake/native-facts';
-import { renderImageSheet, renderSheet } from './intake/render';
+import { renderImageSheet, renderSheet, type RenderedSheet } from './intake/render';
 import { extractSheetByVision } from './stages/vision';
 import { determineApplicability } from './stages/applicability';
 import { verifyFindings } from './stages/verify';
@@ -183,6 +183,39 @@ export async function runReview(opts: ReviewOptions): Promise<ReviewResult> {
   }
   const necbScope = (await lookupClauses('1.1.1.1.(1)'))[0]?.text;
 
+  // Each sheet is rendered once and shared by S1 and S2. S1 needs the images
+  // of sheets with no text layer (scans); S2 needs every sheet.
+  const renders = new Map<string, RenderedSheet>();
+  const render = async (sheet: SheetInventory): Promise<RenderedSheet> => {
+    const cached = renders.get(sheet.number);
+    if (cached) return cached;
+    const r =
+      opts.kind === 'pdf'
+        ? await renderSheet(opts.filePath, sheet.pdf_page, sheet.number, sheet.size_pt)
+        : await renderImageSheet(opts.filePath, sheet.number);
+    renders.set(sheet.number, r);
+    return r;
+  };
+
+  if (useVision) {
+    for (const sheet of intakeResult.sheets.filter((s) => !s.has_text_layer)) {
+      try {
+        await render(sheet);
+      } catch (err) {
+        warnings.push(
+          `sheet ${sheet.number}: could not be rendered as an image. ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+  }
+  if (intakeResult.sheets.every((s) => !s.has_text_layer && !renders.has(s.number))) {
+    return stopped(
+      useVision
+        ? 'none of the sheets has a text layer and none could be rendered as an image, so there is nothing to read the building size and use from'
+        : 'none of the sheets has a text layer and the vision pass is off, so there is nothing to read the building size and use from',
+    );
+  }
+
   let applicability: Applicability;
   let predicates: Record<string, boolean | undefined>;
   try {
@@ -190,6 +223,7 @@ export async function runReview(opts: ReviewOptions): Promise<ReviewResult> {
       intakeResult.sheets,
       { part9Scope, necbScope },
       ledger,
+      renders,
     );
     if (s1.stop) return stopped(s1.stop);
     applicability = s1.applicability;
@@ -208,34 +242,43 @@ export async function runReview(opts: ReviewOptions): Promise<ReviewResult> {
   const negative: NegativeEvidence[] = [];
 
   if (useVision) {
-    for (const sheet of intakeResult.sheets) {
-      try {
-        const rendered =
-          opts.kind === 'pdf'
-            ? await renderSheet(opts.filePath, sheet.pdf_page, sheet.number, sheet.size_pt)
-            : await renderImageSheet(opts.filePath, sheet.number);
-        const v = await extractSheetByVision(
-          opts.filePath,
-          sheet,
-          PART9_RULES,
-          conventions,
-          ledger,
-          { rendered },
-        );
-        facts.push(...v.facts);
-        negative.push(...v.negative);
-        progress(
-          'S2',
-          `sheet ${sheet.number}: ${v.facts.length} value(s), ${v.facts.filter((f) => f.stable).length} read the same way twice`,
-        );
-      } catch (err) {
-        if (err instanceof BudgetExceededError) throw err;
-        warnings.push(
-          `sheet ${sheet.number}: the vision pass failed, so only values in the text layer were read. ${
-            err instanceof Error ? err.message : String(err)
-          }`,
-        );
+    // Sheets are read at the same time. One after another, a two-sheet set
+    // spent over four minutes here and Vercel cut the function off at 300 s.
+    // Results are merged in sheet order so fact ids and warnings stay stable.
+    const results = await Promise.all(
+      intakeResult.sheets.map(async (sheet) => {
+        try {
+          const rendered = await render(sheet);
+          const v = await extractSheetByVision(
+            opts.filePath,
+            sheet,
+            PART9_RULES,
+            conventions,
+            ledger,
+            { rendered },
+          );
+          progress(
+            'S2',
+            `sheet ${sheet.number}: ${v.facts.length} value(s), ${v.facts.filter((f) => f.stable).length} read the same way twice`,
+          );
+          return { ok: true as const, v };
+        } catch (err) {
+          return { ok: false as const, sheet, err };
+        }
+      }),
+    );
+    for (const r of results) {
+      if (r.ok) {
+        facts.push(...r.v.facts);
+        negative.push(...r.v.negative);
+        continue;
       }
+      if (r.err instanceof BudgetExceededError) throw r.err;
+      warnings.push(
+        `sheet ${r.sheet.number}: the vision pass failed, so only values in the text layer were read. ${
+          r.err instanceof Error ? r.err.message : String(r.err)
+        }`,
+      );
     }
   }
 

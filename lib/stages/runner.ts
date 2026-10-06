@@ -61,6 +61,8 @@ export type ContentBlock =
 
 export interface StageCall<T extends z.ZodTypeAny> {
   stage: StageName;
+  /** Overrides the stage's default model, for a call that needs another tier. */
+  model?: string;
   /** Bumped whenever the prompt text changes, so §G10 can tell runs apart. */
   promptVersion: string;
   system: string;
@@ -95,7 +97,7 @@ function textOf(blocks: Array<{ type: string; text?: string }>): string {
 export async function runStage<T extends z.ZodTypeAny>(
   call: StageCall<T>,
 ): Promise<z.infer<T>> {
-  const model = MODELS[call.stage];
+  const model = call.model ?? MODELS[call.stage];
   call.ledger.assertHeadroom();
 
   let content = call.content;

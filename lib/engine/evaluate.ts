@@ -230,11 +230,26 @@ export function evaluate(input: EvaluateInput): EvaluateOutput {
         continue;
       }
 
-      const values = [...bySheet.entries()].map(([sheet, fs]) => ({
-        sheet,
-        value: typeof fs[0].value === 'number' ? fs[0].value : NaN,
-        fact: fs[0],
-      }));
+      // Only numeric readings can be compared. A sheet whose reading is not a
+      // number is left out rather than coerced: NaN never equals anything, so
+      // it used to turn an unreadable value into a false drawing conflict.
+      const values = [...bySheet.entries()].flatMap(([sheet, fs]) => {
+        const f = fs.find((x) => typeof x.value === 'number' && Number.isFinite(x.value));
+        return f ? [{ sheet, value: f.value as number, fact: f }] : [];
+      });
+
+      if (values.length < 2) {
+        findings.push({
+          ...base,
+          id: nextId(),
+          status: 'cant_determine',
+          summary: `${rule.title}: a numeric reading appears on ${values.length} sheet(s), so it cannot be cross-checked.`,
+          fact_ids: relevant.map((f) => f.id),
+          computed: { sheets: [...bySheet.keys()].join(', ') },
+          drawing_reference: drawingRef(relevant),
+        });
+        continue;
+      }
       const distinct = new Set(values.map((v) => v.value));
 
       if (distinct.size > 1) {

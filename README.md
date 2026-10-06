@@ -73,7 +73,9 @@ upload
 
 Everything runs from one orchestrator, `lib/review.ts`. The web route
 (`app/api/analyze/route.ts`) and the command line (`npm run review`) both call
-it, so there is exactly one pipeline. Every stage reads and writes JSON that is
+it, so there is exactly one pipeline. Independent model calls run at the same time (both extraction passes, every
+sheet, and up to four verifier checks), which keeps a two-sheet review at about
+1.5 to 3 minutes. Every stage reads and writes JSON that is
 validated against a zod schema. If validation fails, the stage retries once with
 the error attached, and then the run stops as `needs_manual_review` instead of
 guessing.
@@ -110,9 +112,17 @@ after it comes from the wrong part of the code.
   not the lot size. Both mistakes happened during development (the model once
   returned the 200 m² lot as the building area) and are now ruled out
   structurally: areas are read per storey and the footprint is computed.
-- Low confidence stops the run. Conflicting inputs stop it only if the
-  worst-case reading could cross a Part 9 limit, so a bookkeeping mismatch in an
-  area schedule does not block a house that is clearly Part 9 either way.
+- Scanned sheets have no text, so S1 is given their images and runs on Sonnet,
+  which reads drawings more reliably than Haiku. Sets with a text layer stay on
+  Haiku.
+- Most house drawings have no area schedule. Then the model copies each plan's
+  overall dimension strings and code multiplies them. That rectangle is never
+  smaller than the real footprint, so it is a safe upper bound for the 600 m²
+  test.
+- Low confidence and conflicting inputs stop the run only when they could
+  change the answer. A residential building still inside the Part 9 limits at
+  twice the area read and one storey more continues, with a note for the
+  reviewer saying why. Below confidence 0.3 the run always stops.
 
 ### S2 Extraction (`lib/stages/vision.ts`, Sonnet with vision)
 
@@ -413,8 +423,10 @@ Vercel deploys `main` to production automatically
 Things that have broken deploys before, so they are set up deliberately:
 
 - **Function duration.** `/api/analyze` sets `maxDuration = 300`, the most the
-  Hobby plan allows. A review that runs longer is cut off. Upgrading to Pro
-  allows up to 800 seconds.
+  Hobby plan allows. A review that runs longer is cut off with a 504. Measured
+  locally: 94 s for the scanned sample, 176 s for Chesnut. Upgrading to Pro
+  allows up to 800 seconds; running reviews as background jobs removes the
+  limit.
 - **Files read at runtime must be bundled.** `next.config.js` lists them under
   `outputFileTracingIncludes`: the pdfjs worker, `data/code-store.json`, and
   `@napi-rs/canvas` (which pdfjs needs on a server and loads in a way the
