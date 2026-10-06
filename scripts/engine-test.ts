@@ -18,6 +18,8 @@ import {
   FindingSchema,
   downgrade,
 } from '../lib/schemas';
+import type { SpaceClass } from '../lib/engine/spaces';
+import { classifySpace } from '../lib/engine/spaces';
 
 loadEnv({ path: path.resolve(process.cwd(), '.env.local') });
 
@@ -58,6 +60,7 @@ function drawingFact(
   sheet: string,
   source_text: string,
   stable = true,
+  space?: SpaceClass,
 ): Fact {
   return {
     id,
@@ -65,6 +68,7 @@ function drawingFact(
     value,
     unit,
     subject,
+    ...(space ? { space } : {}),
     provenance: 'drawing_text',
     sheet,
     tile: `${sheet}-t1`,
@@ -103,7 +107,7 @@ function main() {
     // F1: rooftop parapet 0.50 m where a guard needs 1 070 mm
     drawingFact('f-guard', 'guard_height_mm', 0.5, 'm', 'rooftop terrace guard', '02', '0.50'),
     // F2: P2 doors 800 mm at the entrance hall / stair
-    drawingFact('f-door-p2', 'door_width_mm', 800, 'mm', 'P2 door at entrance hall', '01', '800'),
+    drawingFact('f-door-p2', 'door_width_mm', 800, 'mm', 'P2 door at entrance hall', '01', '800', true, 'entrance'),
     // F9: clear height 2.60 m against a 2.1 m minimum
     drawingFact('f-ceiling', 'ceiling_height_mm', 2.6, 'm', 'ground floor', '02', '2.60'),
   ];
@@ -135,7 +139,6 @@ function main() {
     negative,
     applicability: CHESNUT_APP,
     predicates: {
-      door_serves_entrance_or_stair: true,
       has_storage_garage: true,
       has_garage_or_fuel_appliance: true,
       not_sprinklered: true,
@@ -178,12 +181,12 @@ function main() {
   );
   ok('F2 shortfall is 10 mm', doorEntrance[0]?.computed.shortfall === 10);
 
-  // F10 — the same 800 mm door passes the 760 mm and 610 mm thresholds.
+  // F10: an entrance door is judged only against the entrance threshold, not
+  // reported again under the room and bathroom rules.
   ok(
-    'F10 door passes the 760 mm rule',
-    byRule('door-width-rooms').every((f) => f.status === 'pass') === false ||
-      byRule('door-width-rooms').length === 0 ||
-      byRule('door-width-rooms')[0].status === 'pass',
+    'F10 entrance door is not also judged as a room or bathroom door',
+    byRule('door-width-rooms').length === 0 && byRule('door-width-bathroom').length === 0,
+    `rooms ${byRule('door-width-rooms').length}, bathroom ${byRule('door-width-bathroom').length}`,
   );
 
   // F9 — ceiling 2.60 m passes 2.1 m. This is the unit-normalization case:
@@ -252,6 +255,61 @@ function main() {
     'instability is recorded in computed',
     typeof unstable.findings[0]?.computed.stability === 'string',
   );
+
+  console.log('\nSpace scoping (Table 9.5.5.1. by what each door serves):');
+  resetFindingIds();
+  const doors = evaluate({
+    rules: PART9_RULES,
+    facts: [
+      drawingFact('d-bath', 'door_width_mm', 800, 'mm', 'P2 door at bathroom', '01', 'P2 0.80 m', true, 'bathroom'),
+      drawingFact('d-clo', 'door_width_mm', 800, 'mm', 'P2 door at closet', '01', 'P2 0.80 m', true, 'closet'),
+      drawingFact('d-hall', 'door_width_mm', 1100, 'mm', 'P1 door at hall', '01', 'P1 1.10 m', true, 'hallway'),
+      drawingFact('d-unk', 'door_width_mm', 800, 'mm', 'P2 door', '01', 'P2 0.80 m'),
+      drawingFact('d-wide', 'door_width_mm', 900, 'mm', 'D3 door', '01', 'D3 900'),
+      drawingFact('d-narrow', 'door_width_mm', 550, 'mm', 'D4 door', '01', 'D4 550'),
+    ],
+    negative: [],
+    applicability: CHESNUT_APP,
+  });
+  const forFact = (id: string) => doors.findings.filter((f) => f.fact_ids.includes(id));
+  ok('each door produces exactly one finding', ['d-bath', 'd-hall', 'd-unk', 'd-wide', 'd-narrow'].every((id) => forFact(id).length === 1),
+    ['d-bath', 'd-hall', 'd-unk', 'd-wide', 'd-narrow'].map((id) => `${id}:${forFact(id).length}`).join(' '));
+  ok('bathroom door judged against 610 mm and passes', forFact('d-bath')[0]?.rule_id === 'door-width-bathroom' && forFact('d-bath')[0]?.status === 'pass');
+  ok('reach-in closet door is not judged (not in Table 9.5.5.1.)', forFact('d-clo').length === 0);
+  ok('hall door judged against 760 mm and passes', forFact('d-hall')[0]?.rule_id === 'door-width-rooms' && forFact('d-hall')[0]?.status === 'pass');
+  ok('unknown-space 800 mm door is one cant_determine listing the options',
+    forFact('d-unk')[0]?.status === 'cant_determine' && typeof forFact('d-unk')[0]?.computed.could_require === 'string');
+  ok('unknown-space 900 mm door passes the strictest threshold', forFact('d-wide')[0]?.status === 'pass');
+  ok('unknown-space 550 mm door is short of every threshold', forFact('d-narrow')[0]?.status === 'needs_confirmation');
+  ok('no "nothing shown" row is repeated across the door group',
+    doors.findings.filter((f) => f.rule_id.startsWith('door-width') && f.fact_ids.length === 0).length === 0);
+
+  console.log('\nWhat a finding asks for:');
+  ok('a pass asks for nothing', doors.findings.filter((f) => f.status === 'pass').every((f) => f.required_action === ''));
+  ok('an unknown-space door asks for its room to be labelled, not to be widened',
+    /label/i.test(forFact('d-unk')[0]?.required_action ?? '') && !/widen/i.test(forFact('d-unk')[0]?.required_action ?? ''));
+  const missingSmoke = out.findings.find((f) => f.rule_id === 'smoke-alarms');
+  ok('a cant_determine asks for the missing information', /^Show smoke alarm locations/.test(missingSmoke?.required_action ?? ''), missingSmoke?.required_action);
+  ok('a shortfall still asks for the fix', /Raise the guard/.test(byRule('guard-height')[0]?.required_action ?? ''));
+
+  console.log('\nCeiling height skips outdoor spaces:');
+  resetFindingIds();
+  const roof = evaluate({
+    rules: [ruleById('ceiling-height')!],
+    facts: [drawingFact('c-roof', 'ceiling_height_mm', 2.6, 'm', 'rooftop', '02', 'NLT=+05.60', true, 'roof')],
+    negative: [],
+    applicability: CHESNUT_APP,
+  });
+  ok('a rooftop is not checked as a room', roof.findings.filter((f) => f.fact_ids.includes('c-roof')).length === 0);
+
+  console.log('\nKeyword classification of printed labels:');
+  for (const [label, want] of [
+    ['P2 door at bathroom', 'bathroom'], ['P2 door at 1/2 bathroom', 'bathroom'], ['P2 door at Entrance hall', 'entrance'],
+    ['P1 door at hall', 'hallway'], ['P2 door at closet', 'closet'], ['WIC', 'walk_in_closet'], ['P2 door at service yard', 'exterior'],
+    ['rooftop', 'roof'], ['baño', 'bathroom'], ['salle de bain', 'bathroom'], ['Rec Rm', 'habitable_room'], ['Mech', 'service_room'], ['Storage room', 'service_room'], ['Pantry', 'closet'], ['', 'unknown'],
+  ] as const) {
+    ok(`"${label}" is ${want}`, classifySpace(label) === want, `got ${classifySpace(label)}`);
+  }
 
   console.log('\nApplicability scoping:');
   const part3 = evaluate({

@@ -5,6 +5,7 @@
 // needs_manual_review (§4, §G11).
 
 import { z } from 'zod';
+import { SPACE_CLASSES } from './engine/spaces';
 
 export const EDITION = 'NBC(AE) 2023' as const;
 export const PRINTING = 'second, April 2026 revisions' as const;
@@ -61,6 +62,11 @@ const FactBase = {
   value: z.union([z.number(), z.string(), z.boolean()]),
   unit: z.string().optional(),
   subject: z.string(), // "rooftop terrace guard"
+  /**
+   * The space the element serves (lib/engine/spaces.ts). Rules whose
+   * requirement depends on the space select facts by it. Absent means unknown.
+   */
+  space: z.enum(SPACE_CLASSES).optional(),
   /** Run index for the §G6 double extraction. Geometry facts are exact and always run 1. */
   run: z.union([z.literal(1), z.literal(2)]),
   stable: z.boolean(),
@@ -239,15 +245,42 @@ export const RuleSchema = z.object({
       occupancy: z.string().optional(),
       /** Free-form predicate name resolved in the engine, e.g. "has_storage_garage". */
       predicate: z.string().optional(),
+      /**
+       * Which facts the rule judges, by the space each one serves. `in` limits
+       * it to those spaces; `not_in` excludes some. A fact whose space is
+       * unknown is never silently judged against a space-specific threshold:
+       * see `scope_group`.
+       */
+      fact_space: z
+        .object({
+          in: z.array(z.enum(SPACE_CLASSES)).optional(),
+          not_in: z.array(z.enum(SPACE_CLASSES)).optional(),
+        })
+        .optional(),
     })
     .default({}),
+  /**
+   * Rules that are one clause split by space, such as the three door widths of
+   * Table 9.5.5.1. A fact whose space is unknown gets ONE finding for the whole
+   * group instead of one per rule: a pass when it meets the strictest threshold
+   * in the group (so it complies whatever it serves), otherwise
+   * cant_determine listing the thresholds it could be held to.
+   */
+  scope_group: z.string().optional(),
   test: RuleTestSchema,
   /** Where the human transcriber read the threshold, so a test can cite it (§6). */
   transcribed_from: z.object({
     printed_page: z.string(),
     pdf_page: z.number().int().positive(),
   }),
+  /** What to change when the drawings show a contravention or a conflict. */
   required_action: z.string(),
+  /**
+   * What to add when the drawings do not show enough to decide. Without it a
+   * cant_determine finding told the reader to "widen the door" on an 800 mm
+   * door that may well comply.
+   */
+  missing_action: z.string().optional(),
   /**
    * Measured precision on the benchmark and when it was measured (§G8). Only a
    * rule at or above the gate may display `fail` automatically; everything else
