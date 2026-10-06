@@ -16,7 +16,7 @@
 
 import path from 'path';
 import { config as loadEnv } from 'dotenv';
-import { intake } from '../lib/intake/sheets';
+import { intake, type SheetInventory } from '../lib/intake/sheets';
 import { extractNativeFacts } from '../lib/intake/native-facts';
 import { evaluate, attachClauseQuotes, resetFindingIds } from '../lib/engine/evaluate';
 import { PART9_RULES } from '../lib/rules/part9';
@@ -24,6 +24,54 @@ import { loadCodeStore, lookupClauses, quoteIsGrounded } from '../lib/code-store
 import type { Applicability, Finding, NegativeEvidence } from '../lib/schemas';
 
 loadEnv({ path: path.resolve(process.cwd(), '.env.local') });
+
+/**
+ * Storey count and building area off the sheet's own area schedule.
+ *
+ * Deliberately narrow: it reads the printed "TOTAL M2 OF CONSTRUCTION" style
+ * schedule and counts the floor labels. When the sheet does not carry one it
+ * returns null and the run stops, because §1.3.3.3.(1) turns on building area
+ * and storeys and guessing either decides which Part governs.
+ */
+function readAreaSchedule(sheets: SheetInventory[]): {
+  storeys: number;
+  area_m2: number;
+  occupancy: string;
+  evidence: string;
+} | null {
+  const all = sheets.flatMap((s) => s.text_items.map((t) => t.text.trim()));
+  const joined = all.join(' ');
+
+  // "TOTAL M2 OF CONSTRUCTION:" followed by the figure, possibly a few items later.
+  const totalIdx = all.findIndex((t) => /TOTAL\s*M2\s*OF\s*CONSTRUCTION/i.test(t));
+  let area_m2: number | null = null;
+  if (totalIdx >= 0) {
+    for (const t of all.slice(totalIdx + 1, totalIdx + 8)) {
+      const m = t.match(/^(\d{2,5}(?:[.,]\d+)?)\s*(?:m2|M2)?$/);
+      if (m) {
+        area_m2 = Number(m[1].replace(',', '.'));
+        break;
+      }
+    }
+  }
+  if (area_m2 == null) return null;
+
+  // Storeys from the floor labels the schedule names.
+  const labels = ['GROUND FLOOR', 'FIRST LEVEL', 'SECOND LEVEL', 'THIRD LEVEL'];
+  const storeys = labels.filter((l) => new RegExp(l, 'i').test(joined)).length;
+  if (storeys === 0) return null;
+
+  const residential = /bedroom|dwelling|residence|house/i.test(joined);
+
+  return {
+    storeys,
+    area_m2,
+    occupancy: residential
+      ? 'Group C, residential (single dwelling unit)'
+      : 'not stated on the sheets',
+    evidence: `TOTAL M2 OF CONSTRUCTION = ${area_m2} m2, ${storeys} storey label(s) in the area schedule`,
+  };
+}
 
 const STATUS_ORDER = ['fail', 'drawing_conflict', 'needs_confirmation', 'cant_determine', 'pass'];
 
@@ -61,23 +109,40 @@ async function main() {
     console.log(`   ${' '.repeat(20)} "${f.source_text}"  sheet ${f.provenance === 'drawing_text' ? f.sheet : 'ifc'}`);
   }
 
-  // ---- S1 (asserted, not yet judged) ------------------------------------
-  // These come from the sheet text and the area schedule. Until S1 runs on
-  // Haiku this is an assertion, and it is labelled as one.
+  // ---- S1 (not yet wired to Haiku) --------------------------------------
+  // §S1 is explicit that low confidence or conflicting inputs stop the run and
+  // ask a human. Until the Haiku stage exists there is no determination at all,
+  // so the honest behaviour is to stop rather than to assume.
+  //
+  // This previously hardcoded the Chesnut values (2 storeys, 134.17 m2) and
+  // printed them as "asserted". Running a different set then reported that
+  // building as 134.17 m2 with a straight face, which is exactly the failure
+  // the §S1 stop exists to prevent.
+  const area = readAreaSchedule(intakeResult.sheets);
+  if (!area) {
+    console.log('\nS1 applicability: CANNOT DETERMINE');
+    console.log('   No area schedule or storey count could be read from the sheets, and the');
+    console.log('   Haiku applicability stage is not wired yet. §S1 stops the run rather than');
+    console.log('   assuming a Part, so no findings are produced.');
+    console.log('\nRun status: needs_manual_review');
+    return;
+  }
+
   const applicability: Applicability = {
-    major_occupancy: 'Group C, residential (single dwelling unit)',
-    storeys: 2,
-    building_area_m2: 134.17,
+    major_occupancy: area.occupancy,
+    storeys: area.storeys,
+    building_area_m2: area.area_m2,
     code_parts: ['9'],
     edition: 'NBC(AE) 2023',
     energy_path: 'NBC_9.36',
     confidence: 0.5,
     basis: { code_parts: '1.3.3.3.(1)', energy_path: '9.36.', major_occupancy: '1.4.1.2.' },
-    notes: ['asserted from sheet text; S1 applicability stage not yet wired to Haiku'],
+    notes: [`read from the sheet area schedule: ${area.evidence}`],
   };
   console.log(
-    `\nS1 applicability (ASSERTED, not determined): Part ${applicability.code_parts.join(', ')}, ${applicability.energy_path}, ${applicability.storeys} storeys, ${applicability.building_area_m2} m2`,
+    `\nS1 applicability (READ FROM SHEET, not yet judged by Haiku): Part ${applicability.code_parts.join(', ')}, ${applicability.energy_path}, ${applicability.storeys} storeys, ${applicability.building_area_m2} m2`,
   );
+  console.log(`   basis: ${area.evidence}`);
 
   // Negative evidence for every rule with no supporting fact, so §G5 can
   // report cant_determine with a reason rather than by silence.
