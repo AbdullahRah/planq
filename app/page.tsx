@@ -910,8 +910,6 @@ function RunFooter({ result }: { result: ApiResult }) {
         <span>run {result.run_id}</span>
         <span>{result.code_edition}</span>
         <span>store {result.code_store_hash.slice(0, 12)}</span>
-        <span>${result.audit.total_cost_usd.toFixed(4)}</span>
-        <span>{result.audit.usage.length} model calls</span>
         {result.verification.checked > 0 && (
           <span>
             {result.verification.checked} verified, {result.verification.downgraded} downgraded
