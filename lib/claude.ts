@@ -9,17 +9,40 @@
 
 import Anthropic from '@anthropic-ai/sdk';
 
-// An API key that is not scoped to a single workspace must name one per
-// request, or every call fails with a 400 telling you to add this header. A
-// workspace-scoped key needs nothing here.
-const workspaceId = process.env.ANTHROPIC_WORKSPACE_ID?.trim();
+/**
+ * The client, built on first use rather than at import.
+ *
+ * Constructing it at module scope read the environment before dotenv had loaded
+ * .env.local: ES imports are hoisted, so this module ran before the caller's
+ * loadEnv() and every run died with "Could not resolve authentication method"
+ * despite a valid key being on disk.
+ */
+let client: Anthropic | null = null;
 
-export const anthropic = new Anthropic({
-  // Resolves ANTHROPIC_API_KEY, then ANTHROPIC_AUTH_TOKEN, then an
-  // `ant auth login` profile. Never hardcode a key.
-  maxRetries: 2,
-  ...(workspaceId ? { defaultHeaders: { 'anthropic-workspace-id': workspaceId } } : {}),
-});
+export function getAnthropic(): Anthropic {
+  if (client) return client;
+  // An API key that is not scoped to a single workspace must name one per
+  // request, or every call fails with a 400 asking for this header. A
+  // workspace-scoped key needs nothing here.
+  const workspaceId = process.env.ANTHROPIC_WORKSPACE_ID?.trim();
+  client = new Anthropic({
+    // Resolves ANTHROPIC_API_KEY, then ANTHROPIC_AUTH_TOKEN, then an
+    // `ant auth login` profile. Never hardcode a key.
+    maxRetries: 2,
+    ...(workspaceId ? { defaultHeaders: { 'anthropic-workspace-id': workspaceId } } : {}),
+  });
+  return client;
+}
+
+/** Back-compat accessor so call sites read naturally. */
+export const anthropic = {
+  get messages() {
+    return getAnthropic().messages;
+  },
+  get beta() {
+    return getAnthropic().beta;
+  },
+};
 
 /**
  * Per-stage model routing. One id per job so a stage can be re-pointed without

@@ -139,6 +139,40 @@ export function inventoryFromItems(
   };
 }
 
+/**
+ * A sheet's text as visual rows, columns preserved with spacing.
+ *
+ * Reading order is useless for a schedule: the PDF interleaves "GROUND FLOOR:"
+ * with unrelated title-block text, so a model handed the flat sequence paired
+ * labels with the wrong figures and read the garden area as a storey. Rows keep
+ * "GROUND FLOOR: 87.82 m2" together, which is how a person reads it.
+ */
+export function layoutLines(sheet: SheetInventory): string[] {
+  const rows = new Map<number, SheetTextItem[]>();
+  for (const i of sheet.text_items) {
+    const key = Math.round(i.y / 6) * 6;
+    const r = rows.get(key);
+    if (r) r.push(i);
+    else rows.set(key, [i]);
+  }
+
+  return [...rows.entries()]
+    .sort((a, b) => b[0] - a[0]) // top-down: PDF y grows upward
+    .map(([, cells]) => {
+      cells.sort((a, b) => a.x - b.x);
+      let line = '';
+      let cursor = 0;
+      for (const c of cells) {
+        const col = Math.round(c.x / 5);
+        if (col > cursor) line += ' '.repeat(Math.min(col - cursor, 40));
+        line += c.text.trim();
+        cursor = col + c.text.trim().length;
+      }
+      return line.trimEnd();
+    })
+    .filter((l) => l.trim().length > 0);
+}
+
 export async function intake(filePath: string): Promise<IntakeResult> {
   const { readFileSync } = await import('node:fs');
   const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs');

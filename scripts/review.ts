@@ -1,127 +1,62 @@
 #!/usr/bin/env ts-node
-// End-to-end review from a drawing PDF (PLANQ_SPEC.md §4).
+// The full review pipeline (PLANQ_SPEC.md §4).
 //
 //   npm run review data/Two-story-house-with-dining-room-in-back.pdf
+//   npm run review -- --no-vision <pdf>     native text only, no model calls
+//   npm run review -- --no-verify <pdf>     skip S4, for a cheaper dry run
+//   npm run review -- --out report.md <pdf> write the S5 report
 //
-// What runs today: S0 intake, native-text extraction, S3 rule engine, and the
-// §G3 quote grounding against the clause store. Every verdict here is
-// deterministic - no model is called, so this is reproducible and free.
-//
-// What is still stubbed, and visibly so in the output:
-//   S1  applicability is asserted from the sheet text rather than judged by
-//       Haiku, so it prints as "asserted" not "determined"
-//   S2  the vision pass that reads what the text layer cannot
-//   S4  the Opus verifier, so every finding reports verifier: not_run
-//   S5  the client report
+// S0 intake, S1 applicability, S2 extraction (native plus vision), S3 rules,
+// S4 adversarial verification, S5 report. Every stage's usage is logged and the
+// run stops if it exceeds its budget (§G10, §G11).
 
 import path from 'path';
+import { promises as fs } from 'fs';
+import { randomUUID } from 'crypto';
 import { config as loadEnv } from 'dotenv';
-import { intake, type SheetInventory } from '../lib/intake/sheets';
+
+import { intake } from '../lib/intake/sheets';
+import { readConventions } from '../lib/intake/legend';
 import { extractNativeFacts } from '../lib/intake/native-facts';
+import { extractSheetByVision } from '../lib/stages/vision';
+import { determineApplicability } from '../lib/stages/applicability';
+import { verifyFindings } from '../lib/stages/verify';
+import { buildReport } from '../lib/stages/report';
+import { RunLedger, BudgetExceededError, StageFailedError } from '../lib/stages/runner';
 import { evaluate, attachClauseQuotes, resetFindingIds } from '../lib/engine/evaluate';
 import { PART9_RULES } from '../lib/rules/part9';
 import { loadCodeStore, lookupClauses, quoteIsGrounded } from '../lib/code-store';
-import type { Applicability, Finding, NegativeEvidence } from '../lib/schemas';
+import { RUN_BUDGET_USD } from '../lib/claude';
+import type { ClauseRecord, Fact, NegativeEvidence, RunAudit } from '../lib/schemas';
 
 loadEnv({ path: path.resolve(process.cwd(), '.env.local') });
 
-/**
- * Storey count and building area off the sheet's own area schedule.
- *
- * The distinction that matters here is building area versus total floor area.
- * Division A 1.3.3.3.(1) applies Part 9 below 600 m2 of BUILDING area, which is
- * the footprint - the greatest horizontal area of a storey - not the sum across
- * storeys. The Chesnut schedule prints both: GROUND FLOOR 87.82 m2 and FIRST
- * LEVEL 122.33 m2 per storey, TOTAL M2 OF CONSTRUCTION 268.33 m2 across them.
- * Feeding 268.33 into a 600 m2 test would push a large house out of Part 9 and
- * into Part 3, changing every rule that then runs.
- *
- * Values are matched by position, not by reading order: the schedule prints its
- * label and figure side by side, and the PDF's item order interleaves them with
- * unrelated title-block text.
- */
-function readAreaSchedule(sheets: SheetInventory[]): {
-  storeys: number;
-  /** Footprint, for 1.3.3.3.(1). */
-  building_area_m2: number;
-  /** Sum across storeys, reported but never compared against the Part 9 limit. */
-  total_floor_area_m2: number | null;
-  occupancy: string;
-  evidence: string;
-} | null {
-  const AREA_RE = /^(\d{1,5}(?:[.,]\d+)?)\s*m[²2]$/i;
-
-  /** The figure printed on the same line as a label, to its right. */
-  const valueFor = (sheet: SheetInventory, labelRe: RegExp): number | null => {
-    const label = sheet.text_items.find((t) => labelRe.test(t.text.trim()));
-    if (!label) return null;
-    const near = sheet.text_items
-      .filter(
-        (t) =>
-          t !== label &&
-          Math.abs(t.y - label.y) < 8 &&
-          t.x > label.x &&
-          t.x - label.x < 260 &&
-          AREA_RE.test(t.text.trim()),
-      )
-      .sort((a, b) => a.x - b.x)[0];
-    if (!near) return null;
-    return Number(near.text.trim().match(AREA_RE)![1].replace(',', '.'));
-  };
-
-  // Per-storey areas. A storey printed as 0.00 m2 is not a storey.
-  const STOREY_LABELS: Array<[string, RegExp]> = [
-    ['basement', /^BASEMENT\s*:?$/i],
-    ['ground floor', /^GROUND\s+FLOOR\s*:?$/i],
-    ['first level', /^FIRST\s+LEVEL\s*:?$/i],
-    ['second level', /^SECOND\s+LEVEL\s*:?$/i],
-    ['third level', /^THIRD\s+LEVEL\s*:?$/i],
-  ];
-
-  const storeyAreas: Array<{ name: string; area: number }> = [];
-  let total: number | null = null;
-
-  for (const sheet of sheets) {
-    for (const [name, re] of STOREY_LABELS) {
-      if (storeyAreas.some((s) => s.name === name)) continue;
-      const v = valueFor(sheet, re);
-      if (v != null) storeyAreas.push({ name, area: v });
-    }
-    if (total == null) total = valueFor(sheet, /^TOTAL\s*M2\s*OF\s*CONSTRUCTION\s*:?$/i);
-  }
-
-  const occupied = storeyAreas.filter((s) => s.area > 0);
-  if (occupied.length === 0) return null;
-
-  const building_area_m2 = Math.max(...occupied.map((s) => s.area));
-  const joined = sheets.flatMap((s) => s.text_items.map((t) => t.text)).join(' ');
-  const residential = /bedroom|dwelling|residence|house/i.test(joined);
-
-  return {
-    storeys: occupied.length,
-    building_area_m2,
-    total_floor_area_m2: total,
-    occupancy: residential
-      ? 'Group C, residential (single dwelling unit)'
-      : 'not stated on the sheets',
-    evidence:
-      `${occupied.map((s) => `${s.name} ${s.area} m2`).join(', ')}` +
-      `; building area (largest storey) ${building_area_m2} m2` +
-      (total != null ? `; total floor area ${total} m2, not used for 1.3.3.3.(1)` : ''),
-  };
-}
-
 const STATUS_ORDER = ['fail', 'drawing_conflict', 'needs_confirmation', 'cant_determine', 'pass'];
 
+function flag(name: string): boolean {
+  return process.argv.includes(`--${name}`);
+}
+function opt(name: string): string | undefined {
+  const i = process.argv.indexOf(`--${name}`);
+  return i >= 0 ? process.argv[i + 1] : undefined;
+}
+
 async function main() {
-  const file = process.argv[2];
+  const file = process.argv.slice(2).find((a) => a.endsWith('.pdf'));
   if (!file) {
-    console.error('usage: npm run review <drawing.pdf>');
+    console.error('usage: npm run review <drawing.pdf> [--no-vision] [--no-verify] [--out report.md]');
     process.exit(1);
   }
 
+  const useVision = !flag('no-vision');
+  const useVerify = !flag('no-verify');
+  const outPath = opt('out');
+  const runId = randomUUID().slice(0, 8);
+
   const store = await loadCodeStore();
-  console.log(`Planq review  ${path.basename(file)}`);
+  const ledger = new RunLedger(RUN_BUDGET_USD.permitSet);
+
+  console.log(`Planq review  ${path.basename(file)}   run ${runId}`);
   console.log(`Code: ${store.edition} (${store.printing}), store ${store.store_sha256.slice(0, 12)}\n`);
 
   // ---- S0 ---------------------------------------------------------------
@@ -129,145 +64,227 @@ async function main() {
   console.log(`S0 intake: ${intakeResult.sheets.length} sheet(s), file ${intakeResult.file_sha256.slice(0, 12)}`);
   for (const s of intakeResult.sheets) {
     console.log(
-      `   sheet ${s.number}  "${s.title}"  ${s.scale_statement ?? 'no scale stated'}  ${s.units}  ${Math.round(s.size_pt.width)}x${Math.round(s.size_pt.height)}pt  ${s.text_items.length} text items`,
+      `   sheet ${s.number}  "${s.title}"  ${s.scale_statement ?? 'no scale stated'}  ${s.units}  ${s.text_items.length} text items`,
     );
   }
-  if (intakeResult.warnings.length > 0) {
-    console.log('\n   intake warnings:');
-    for (const w of intakeResult.warnings) console.log(`   ! ${w}`);
-  }
+  for (const w of intakeResult.warnings) console.log(`   ! ${w}`);
 
-  // ---- S2 (native portion) ----------------------------------------------
-  const { facts, levels } = extractNativeFacts(intakeResult.sheets);
-  console.log(`\nS2 native extraction: ${facts.length} fact(s), ${levels.length} level mark(s)`);
-  for (const f of facts) {
-    console.log(
-      `   ${f.kind.padEnd(20)} ${String(f.value).padStart(6)} ${(f.unit ?? '').padEnd(5)} ${f.subject}`,
-    );
-    console.log(`   ${' '.repeat(20)} "${f.source_text}"  sheet ${f.provenance === 'drawing_text' ? f.sheet : 'ifc'}`);
-  }
+  const conventions = readConventions(intakeResult.sheets);
+  console.log(
+    `\nNotation: ${conventions.declared.length} convention(s) declared by the sheets, ${conventions.assumed.length} assumed`,
+  );
+  for (const d of conventions.declared) console.log(`   declared: ${d}`);
 
-  // ---- S1 (not yet wired to Haiku) --------------------------------------
-  // §S1 is explicit that low confidence or conflicting inputs stop the run and
-  // ask a human. Until the Haiku stage exists there is no determination at all,
-  // so the honest behaviour is to stop rather than to assume.
-  //
-  // This previously hardcoded the Chesnut values (2 storeys, 134.17 m2) and
-  // printed them as "asserted". Running a different set then reported that
-  // building as 134.17 m2 with a straight face, which is exactly the failure
-  // the §S1 stop exists to prevent.
-  const area = readAreaSchedule(intakeResult.sheets);
-  if (!area) {
-    console.log('\nS1 applicability: CANNOT DETERMINE');
-    console.log('   No area schedule or storey count could be read from the sheets, and the');
-    console.log('   Haiku applicability stage is not wired yet. §S1 stops the run rather than');
-    console.log('   assuming a Part, so no findings are produced.');
-    console.log('\nRun status: needs_manual_review');
+  // ---- S1 ---------------------------------------------------------------
+  const part9Scope = (await lookupClauses('1.3.3.3.(1)'))[0]?.text;
+  if (!part9Scope) {
+    console.error('code store has no Division A 1.3.3.3.(1); cannot determine applicability');
+    process.exit(1);
+  }
+  const necbScope = (await lookupClauses('1.1.1.1.(1)'))[0]?.text;
+
+  const s1 = await determineApplicability(
+    intakeResult.sheets,
+    { part9Scope, necbScope },
+    ledger,
+  ).catch((err) => {
+    console.error(`\nS1 failed: ${err instanceof Error ? err.message : err}`);
+    return null;
+  });
+  if (!s1) {
+    console.log('Run status: needs_manual_review');
+    return;
+  }
+  const app = s1.applicability;
+  const predicates = s1.predicates;
+
+  console.log(
+    `\nS1 applicability: Part ${app.code_parts.join(', ')}, ${app.energy_path === 'NBC_9.36' ? 'Section 9.36' : 'NECB 2020'}, ${app.storeys} storeys, building area ${app.building_area_m2} m2  (confidence ${app.confidence.toFixed(2)})`,
+  );
+  for (const [k, v] of Object.entries(app.basis)) console.log(`   ${k}: ${v}`);
+  if (s1.stop) {
+    console.log(`\nS1 STOP: ${s1.stop}`);
+    console.log('Run status: needs_manual_review');
     return;
   }
 
-  const applicability: Applicability = {
-    major_occupancy: area.occupancy,
-    storeys: area.storeys,
-    building_area_m2: area.building_area_m2,
-    code_parts: ['9'],
-    edition: 'NBC(AE) 2023',
-    energy_path: 'NBC_9.36',
-    confidence: 0.5,
-    basis: { code_parts: '1.3.3.3.(1)', energy_path: '9.36.', major_occupancy: '1.4.1.2.' },
-    notes: [`read from the sheet area schedule: ${area.evidence}`],
-  };
-  console.log(
-    `\nS1 applicability (READ FROM SHEET, not yet judged by Haiku): Part ${applicability.code_parts.join(', ')}, ${applicability.energy_path}, ${applicability.storeys} storeys, building area ${applicability.building_area_m2} m2`,
-  );
-  console.log(`   basis: ${area.evidence}`);
+  // ---- S2 ---------------------------------------------------------------
+  const native = extractNativeFacts(intakeResult.sheets);
+  const facts: Fact[] = [...native.facts];
+  const negative: NegativeEvidence[] = [];
+  console.log(`\nS2 native text: ${native.facts.length} fact(s) from the text layer`);
 
-  // Negative evidence for every rule with no supporting fact, so §G5 can
-  // report cant_determine with a reason rather than by silence.
-  const haveKinds = new Set(facts.map((f) => f.kind));
-  const negative: NegativeEvidence[] = PART9_RULES.filter((r) => {
-    const needed = r.test.kind === 'numeric' ? [r.test.fact_kind] : r.test.kind === 'presence' ? r.test.fact_kinds : [];
-    return needed.length > 0 && !needed.some((k) => haveKinds.has(k));
-  }).map((r) => ({
-    rule_id: r.id,
-    searched_for: ['native text layer', 'schedules', 'general notes'],
-    not_found: ['any stated value'],
-    sheets_searched: intakeResult.sheets.map((s) => s.number),
-  }));
+  if (useVision) {
+    for (const sheet of intakeResult.sheets) {
+      try {
+        const v = await extractSheetByVision(
+          path.resolve(process.cwd(), file),
+          sheet,
+          PART9_RULES,
+          conventions,
+          ledger,
+        );
+        const stable = v.facts.filter((f) => f.stable).length;
+        console.log(
+          `S2 vision sheet ${sheet.number}: ${v.facts.length} fact(s), ${stable} stable across both runs; runs read ${v.runCounts[0]}/${v.runCounts[1]}`,
+        );
+        for (const n of v.notes) console.log(`   note: ${n}`);
+        facts.push(...v.facts);
+        negative.push(...v.negative);
+      } catch (err) {
+        if (err instanceof BudgetExceededError) throw err;
+        console.log(
+          `S2 vision sheet ${sheet.number} failed: ${err instanceof Error ? err.message : err}`,
+        );
+      }
+    }
+  } else {
+    console.log('S2 vision: skipped (--no-vision)');
+  }
+
+  // The native reader and the vision pass both see the whole sheet, so the same
+  // printed value arrives twice and one physical element becomes two findings.
+  //
+  // Deduping on kind + value + unit was wrong: seven different 800 mm doors
+  // share all three and collapsed into one, losing six real elements. Identity
+  // is the element, not the number, and the two sources word their subjects
+  // differently ("P2 door at closet" against "interior door, closet"), so the
+  // subject cannot join them either.
+  //
+  // So dedupe by source precedence instead, per fact kind per sheet: where the
+  // text layer produced readings of a kind, the vision readings of that same
+  // kind on that sheet are redundant. Native wins because it is the characters
+  // themselves rather than a reading of them.
+  const nativeCoverage = new Set(
+    native.facts.map((f) => `${f.kind}|${f.provenance === 'drawing_text' ? f.sheet : 'ifc'}`),
+  );
+  const beforeDedupe = facts.length;
+  const kept = facts.filter((f) => {
+    const isNative = native.facts.some((n) => n.id === f.id);
+    if (isNative) return true;
+    return !nativeCoverage.has(`${f.kind}|${f.provenance === 'drawing_text' ? f.sheet : 'ifc'}`);
+  });
+  const dropped = beforeDedupe - kept.length;
+  facts.length = 0;
+  facts.push(...kept);
+  if (dropped > 0) {
+    console.log(
+      `\nDropped ${dropped} vision fact(s) for kinds the text layer already read verbatim on the same sheet`,
+    );
+  }
+
+  console.log(`\nFacts in play: ${facts.length}`);
+  for (const f of facts) {
+    console.log(
+      `   ${f.stable ? ' ' : '~'} ${f.kind.padEnd(30)} ${String(f.value).padStart(7)} ${(f.unit ?? '').padEnd(5)} ${f.subject}`,
+    );
+    console.log(`     "${f.source_text}"`);
+  }
 
   // ---- S3 ---------------------------------------------------------------
   resetFindingIds();
-  const out = evaluate({
-    rules: PART9_RULES,
-    facts,
-    negative,
-    applicability,
-    predicates: {
-      // Asserted alongside S1; these become model or reviewer answers later.
-      door_serves_entrance_or_stair: undefined,
-      has_storage_garage: true,
-      has_garage_or_fuel_appliance: true,
-      not_sprinklered: true,
-      stair_is_private: true,
-    },
-  });
+  const out = evaluate({ rules: PART9_RULES, facts, negative, applicability: app, predicates });
 
-  // ---- G3: ground every quote in the store ------------------------------
-  const textById = new Map<string, string>();
+  // §G3: the system fetches clause text; the model never supplies it.
+  const clauseCache = new Map<string, ClauseRecord[]>();
   for (const f of out.findings) {
     for (const cid of f.clause_ids) {
-      if (textById.has(cid)) continue;
-      const hits = await lookupClauses(cid);
-      if (hits.length > 0) textById.set(cid, hits[0].text);
+      if (!clauseCache.has(cid)) clauseCache.set(cid, await lookupClauses(cid));
     }
   }
-  const withQuotes = attachClauseQuotes(out.findings, (cid) => textById.get(cid));
+  let findings = attachClauseQuotes(out.findings, (cid) => clauseCache.get(cid)?.[0]?.text);
 
   let ungrounded = 0;
-  for (const f of withQuotes) {
+  for (const f of findings) {
     for (const q of f.clause_quotes) {
-      const clauses = f.clause_ids.flatMap((cid) => {
-        const t = textById.get(cid);
-        return t ? [{ text: t }] : [];
-      });
-      if (!quoteIsGrounded(q, clauses as never)) ungrounded += 1;
+      const cls = f.clause_ids.flatMap((cid) => clauseCache.get(cid) ?? []);
+      if (!quoteIsGrounded(q, cls)) ungrounded += 1;
     }
   }
 
-  // ---- report -----------------------------------------------------------
-  const sorted = [...withQuotes].sort(
-    (a, b) => STATUS_ORDER.indexOf(a.status) - STATUS_ORDER.indexOf(b.status),
-  );
+  console.log(`\nS3 findings: ${findings.length}   G3 ungrounded quotes: ${ungrounded} (must be 0)`);
 
-  const counts = new Map<string, number>();
-  for (const f of sorted) counts.set(f.status, (counts.get(f.status) ?? 0) + 1);
-
-  console.log(`\nS3 findings: ${sorted.length}`);
-  console.log(
-    `   ${STATUS_ORDER.map((s) => `${s} ${counts.get(s) ?? 0}`).join('   ')}`,
-  );
-  console.log(`   judgment rules pending the S2/S3 model pass: ${out.pending_judgment.length}`);
-  console.log(`   rules out of scope: ${out.skipped.length}`);
-  console.log(`   G3 ungrounded quotes: ${ungrounded} (must be 0)\n`);
-
-  for (const f of sorted) {
-    console.log(`${f.id.padEnd(4)} ${f.status.toUpperCase().padEnd(19)} ${f.rule_id}`);
-    console.log(`     ${f.summary}`);
-    console.log(`     clause ${f.clause_ids.join(', ')}${f.drawing_reference ? `   ${f.drawing_reference}` : ''}`);
-    const computed = Object.entries(f.computed)
-      .filter(([, v]) => v !== '')
-      .map(([k, v]) => `${k}=${v}`)
-      .join('  ');
-    if (computed) console.log(`     ${computed}`);
-    console.log(`     verifier: ${f.verifier}   reviewer: ${f.reviewer_state}`);
-    console.log();
+  // ---- S4 ---------------------------------------------------------------
+  if (useVerify) {
+    const factById = new Map(facts.map((f) => [f.id, f]));
+    const res = await verifyFindings(
+      findings,
+      (f) => ({
+        clauses: f.clause_ids.flatMap((cid) => clauseCache.get(cid) ?? []),
+        facts: f.fact_ids.map((id) => factById.get(id)).filter((x): x is Fact => Boolean(x)),
+      }),
+      ledger,
+    );
+    findings = res.findings;
+    console.log(
+      `S4 verifier: ${res.verified} checked, ${res.downgraded} downgraded, ${res.skipped} could not be verified`,
+    );
+  } else {
+    console.log('S4 verifier: skipped (--no-verify)');
   }
 
-  console.log('Not yet run: S1 applicability (Haiku), S2 vision, S4 verifier (Opus), S5 report.');
-  console.log('No report may be released until a named reviewer approves it (§G9).');
+  // ---- summary ----------------------------------------------------------
+  const counts = new Map<string, number>();
+  for (const f of findings) counts.set(f.status, (counts.get(f.status) ?? 0) + 1);
+  console.log(`\n   ${STATUS_ORDER.map((s) => `${s} ${counts.get(s) ?? 0}`).join('   ')}`);
+
+  const sorted = [...findings].sort(
+    (a, b) => STATUS_ORDER.indexOf(a.status) - STATUS_ORDER.indexOf(b.status),
+  );
+  for (const f of sorted) {
+    if (f.status === 'pass') continue;
+    console.log(`\n${f.id.padEnd(4)} ${f.status.toUpperCase().padEnd(19)} ${f.rule_id}`);
+    console.log(`     ${f.summary}`);
+    console.log(`     clause ${f.clause_ids.join(', ')}${f.drawing_reference ? `   ${f.drawing_reference}` : ''}`);
+    if (f.verifier !== 'not_run') console.log(`     verifier: ${f.verifier}, ${f.verifier_reason}`);
+  }
+
+  // ---- G10 audit trail --------------------------------------------------
+  const audit: RunAudit = {
+    run_id: runId,
+    input_file_hashes: { [path.basename(file)]: intakeResult.file_sha256 },
+    code_edition: store.edition as RunAudit['code_edition'],
+    code_store_hash: store.store_sha256,
+    usage: ledger.usage,
+    total_cost_usd: ledger.spentUsd,
+    status: 'complete',
+    started_at: new Date().toISOString(),
+    finished_at: new Date().toISOString(),
+  };
+
+  console.log(
+    `\nG10 usage: ${ledger.usage.length} model call(s), $${ledger.spentUsd.toFixed(4)} of a $${RUN_BUDGET_USD.permitSet} budget`,
+  );
+  for (const u of ledger.usage) {
+    console.log(
+      `   ${u.stage.padEnd(22)} ${u.model.padEnd(18)} in ${String(u.input_tokens).padStart(7)} out ${String(u.output_tokens).padStart(6)} cache ${String(u.cache_read_input_tokens).padStart(7)} $${u.cost_usd.toFixed(4)}`,
+    );
+  }
+
+  // ---- S5 ---------------------------------------------------------------
+  if (outPath) {
+    const md = buildReport({
+      projectName: path.basename(file, '.pdf'),
+      applicability: app,
+      findings,
+      rules: PART9_RULES,
+      audit,
+      intakeWarnings: intakeResult.warnings,
+      assumedConventions: conventions.assumed,
+      // §G9: nothing is released until a named reviewer approves.
+      signOff: null,
+    });
+    await fs.writeFile(path.resolve(process.cwd(), outPath), md);
+    console.log(`\nS5 report written to ${outPath} (unreleased draft, §G9 sign-off pending)`);
+  }
 }
 
 main().catch((err) => {
-  console.error(err instanceof Error ? err.message : err);
+  if (err instanceof BudgetExceededError || err instanceof StageFailedError) {
+    console.error(`\n${err.message}`);
+    console.log('Run status: needs_manual_review');
+    process.exit(2);
+  }
+  console.error(err instanceof Error ? err.stack ?? err.message : err);
   process.exit(1);
 });

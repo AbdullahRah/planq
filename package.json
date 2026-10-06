@@ -15,7 +15,8 @@
     "clause": "ts-node --project tsconfig.scripts.json scripts/clause.ts",
     "verify:rules": "ts-node --project tsconfig.scripts.json scripts/verify-rules.ts",
     "test:engine": "ts-node --project tsconfig.scripts.json scripts/engine-test.ts",
-    "review": "ts-node --project tsconfig.scripts.json scripts/review.ts"
+    "review": "ts-node --project tsconfig.scripts.json scripts/review.ts",
+    "test:verifier": "ts-node --project tsconfig.scripts.json scripts/verifier-test.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.70.1",
