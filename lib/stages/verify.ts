@@ -23,6 +23,8 @@ import {
 } from '../schemas';
 import { runStage, type ContentBlock, type RunLedger } from './runner';
 
+const VERIFY_CONCURRENCY = 4;
+
 const PROMPT_VERSION = 's4-2026-10-05';
 
 const VerdictSchema = z.object({
@@ -154,9 +156,11 @@ export async function verifyFinding(
 }
 
 /**
- * Verify every finding §G7 requires, leaving the rest untouched. Sequential on
- * purpose: the verifier is the most expensive stage, and the ledger has to be
- * able to stop the run mid-way when the budget runs out (§G11).
+ * Verify every finding §G7 requires, leaving the rest untouched. Up to
+ * VERIFY_CONCURRENCY at a time. The ledger still stops the stage when the
+ * budget runs out (§G11): each call checks headroom first, and a finding whose
+ * call is refused is downgraded as unverified rather than left looking upheld.
+ * Running in parallel can overshoot the budget by at most the calls in flight.
  */
 export async function verifyFindings(
   findings: Finding[],
@@ -168,31 +172,39 @@ export async function verifyFindings(
   let downgraded = 0;
   let skipped = 0;
 
-  for (const f of findings) {
-    if (!VERIFIABLE_STATUSES.includes(f.status)) {
-      out.push(f);
-      continue;
-    }
+  // Findings are verified independently, a few at a time, so a set with many
+  // proposed failures does not run past the function time limit. Order is kept.
+  const one = async (f: Finding): Promise<Finding> => {
+    if (!VERIFIABLE_STATUSES.includes(f.status)) return f;
     try {
       const { clauses, facts, evidence } = resolve(f);
       const res = await verifyFinding({ finding: f, clauses, facts, evidence }, ledger);
-      out.push(res.finding);
       verified += 1;
       if (res.downgraded) downgraded += 1;
+      return res.finding;
     } catch (err) {
       // A verifier that could not run must not leave a finding looking verified.
       // §G7 downgrades anything not upheld, and "not run" is not upheld.
-      out.push({
+      skipped += 1;
+      return {
         ...f,
         status: downgrade(f.status),
         verifier: 'uncertain',
         verifier_reason: `verification could not be completed: ${
           err instanceof Error ? err.message : String(err)
         }`,
-      });
-      skipped += 1;
+      };
     }
-  }
+  };
+
+  let next = 0;
+  const worker = async () => {
+    while (next < findings.length) {
+      const i = next++;
+      out[i] = await one(findings[i]);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(VERIFY_CONCURRENCY, findings.length) }, worker));
 
   return { findings: out, verified, downgraded, skipped };
 }

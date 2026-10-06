@@ -26,6 +26,18 @@ import { runStage, type ContentBlock, type RunLedger } from './runner';
 
 const PROMPT_VERSION = 's2-2026-10-05';
 
+/**
+ * A count printed with its marker, such as "12R" for twelve risers, comes back
+ * as a string. Left as one it cannot be compared, and the stair-consistency
+ * rule reported a plan reading "12R" as disagreeing with a section reading 12.
+ * The verbatim text stays in source_text; only the value becomes a number.
+ */
+function normalizeCount<T extends { kind: string; value: number | string | boolean }>(f: T): T {
+  if (typeof f.value !== 'string' || !/_count$/.test(f.kind)) return f;
+  const m = /^\s*(\d+)\s*[A-Za-z]{0,7}\.?\s*$/.exec(f.value);
+  return m ? { ...f, value: Number(m[1]) } : f;
+}
+
 const ObservedFactSchema = z.object({
   kind: z.string(),
   value: z.union([z.number(), z.string(), z.boolean()]),
@@ -219,7 +231,13 @@ export async function extractSheetByVision(
     });
   };
 
-  const [a, b] = [await runOne(1), await runOne(2)];
+  // The two passes are independent, so they run at the same time. Run one
+  // after the other they took about four minutes per sheet, which is most of
+  // Vercel's 300 second function limit on its own.
+  const [a, b] = (await Promise.all([runOne(1), runOne(2)])).map((r) => ({
+    ...r,
+    facts: r.facts.map(normalizeCount),
+  }));
 
   // Stability is agreement on the READING, not on the wording.
   //
