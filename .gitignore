@@ -16,7 +16,10 @@ next-env.d.ts
 .vercel
 supabase/.temp/
 supabase/.branches/
-data/
+# The clause store is built from the NBC PDF, but the deployed function reads it
+# at runtime and there is no PDF on Vercel to rebuild it from, so it ships.
+data/*
+!data/code-store.json
 
 # Agent tooling: local machine settings, and a vendored copy of a vendor's
 # skill docs. Both are regenerable and neither belongs in the repo.

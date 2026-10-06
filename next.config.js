@@ -18,9 +18,14 @@ const nextConfig = {
     //
     // which lib/parsers/pdf.ts catches, leaving a sheet with no page images.
     // Rendering works locally because the file is present in node_modules, so
-    // this only ever shows up once deployed. Trace it in explicitly.
+    // this only ever shows up once deployed. Trace it in explicitly. The clause
+    // store is read with fs at a path built from process.cwd(), so it has the
+    // same problem.
     outputFileTracingIncludes: {
-      '/api/analyze': ['./node_modules/pdfjs-dist/legacy/build/pdf.worker.mjs'],
+      '/api/analyze': [
+        './node_modules/pdfjs-dist/legacy/build/pdf.worker.mjs',
+        './data/code-store.json',
+      ],
     },
   },
 };
