@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { SignedIn, SignedOut, SignInButton, SignUpButton, UserButton } from '@clerk/nextjs';
 import type { Fact, Finding, FindingStatus } from '@/lib/schemas';
 import type { ReviewResult, SheetSummary } from '@/lib/review';
+import { createClient as createSupabaseBrowserClient } from '@/utils/supabase/client';
 
 type Theme = 'dark' | 'light';
 
@@ -21,7 +22,52 @@ type ApiResult = ReviewResult & { plan_id: string };
 interface PipelineStep {
   label: string;
   status: 'pending' | 'active' | 'done';
+  /** "14 / 26" while a stage works through sheets or findings. */
+  detail?: string;
 }
+
+/** What GET /api/analyze/[planId] returns while the background review runs. */
+interface ReviewState {
+  plan_id: string;
+  status: 'uploading' | 'processing' | 'complete' | 'needs_manual_review' | 'failed';
+  progress: { stage: 'S0' | 'S1' | 'S2' | 'S3' | 'S4' | 'done' | 'failed'; detail: string; done?: number; total?: number } | null;
+  error: string | null;
+  result?: ApiResult;
+}
+
+const STAGE_INDEX: Record<string, number> = { S0: 0, S1: 1, S2: 2, S3: 3, S4: 4 };
+
+/** Real progress from the stage and its done/total, not a timer. */
+function progressFor(p: NonNullable<ReviewState['progress']>): number {
+  const frac = p.total ? (p.done ?? 0) / p.total : 0;
+  switch (p.stage) {
+    case 'S0':
+      return 3;
+    case 'S1':
+      return 8;
+    case 'S2':
+      return 12 + frac * 63;
+    case 'S3':
+      return 78;
+    case 'S4':
+      return 80 + frac * 18;
+    case 'done':
+      return 100;
+    default:
+      return 0;
+  }
+}
+
+function stepsFor(p: NonNullable<ReviewState['progress']>): PipelineStep[] {
+  const at = STAGE_INDEX[p.stage] ?? (p.stage === 'done' ? INITIAL_STEPS.length : 0);
+  return INITIAL_STEPS.map((s, i) => ({
+    ...s,
+    status: i < at ? 'done' : i === at ? 'active' : 'pending',
+    detail: i === at && p.total ? `${p.done ?? 0} / ${p.total}` : undefined,
+  }));
+}
+
+const POLL_MS = 3000;
 
 // DXF and DWG are no longer accepted. The old DXF path produced data in the
 // retired ExtractedSheet shape that the rule engine cannot read, and offering
@@ -159,24 +205,52 @@ export default function PlanqPage() {
     setSteps((prev) => prev.map((s, i) => (i === idx ? { ...s, status } : s)));
   };
 
-  // The analysis is a single POST, so there's no real per-stage progress to
-  // read. Ease the bar toward ~90% while we wait, then runAnalyze snaps it to
-  // 100% once the result lands — honest about being indeterminate.
-  useEffect(() => {
-    if (!analyzing) return;
-    setProgress((p) => (p < 8 ? 8 : p));
-    const id = setInterval(() => {
-      setProgress((p) => (p >= 90 ? p : p + Math.max(0.4, (90 - p) * 0.05)));
-    }, 350);
-    return () => clearInterval(id);
-  }, [analyzing]);
-
   // Cycle the humorous status line every few seconds while analyzing.
   useEffect(() => {
     if (!analyzing) return;
     const id = setInterval(() => setQuipIdx((i) => (i + 1) % LOADING_QUIPS.length), 2600);
     return () => clearInterval(id);
   }, [analyzing]);
+
+  // Follow a background review until it finishes. The review runs as a
+  // durable workflow, so this only reads its state; closing the tab does not
+  // stop it, and the plan id in the URL picks it back up.
+  const follow = useCallback(async (planId: string) => {
+    for (;;) {
+      const res = await fetch(`/api/analyze/${planId}`, { cache: 'no-store' });
+      if (!res.ok) throw new Error(`Could not read the review (${res.status})`);
+      const state = (await res.json()) as ReviewState;
+      if (state.progress) {
+        setSteps(stepsFor(state.progress));
+        setProgress(progressFor(state.progress));
+      }
+      if (state.status === 'failed') throw new Error(state.error || 'The review failed.');
+      if (state.result) {
+        setSteps(INITIAL_STEPS.map((s) => ({ ...s, status: 'done' })));
+        setProgress(100);
+        setResult(state.result);
+        return;
+      }
+      await new Promise((r) => setTimeout(r, POLL_MS));
+    }
+  }, []);
+
+  const setPlanInUrl = (planId: string | null) => {
+    const url = new URL(window.location.href);
+    if (planId) url.searchParams.set('plan', planId);
+    else url.searchParams.delete('plan');
+    window.history.replaceState(null, '', url.toString());
+  };
+
+  // A reload or a shared link resumes following the review.
+  useEffect(() => {
+    const planId = new URLSearchParams(window.location.search).get('plan');
+    if (!planId) return;
+    setAnalyzing(true);
+    follow(planId)
+      .catch((err) => setError((err as Error).message))
+      .finally(() => setAnalyzing(false));
+  }, [follow]);
 
   const runAnalyze = async () => {
     if (analyzing || files.length === 0) return;
@@ -186,41 +260,48 @@ export default function PlanqPage() {
     setSteps(INITIAL_STEPS.map((s) => ({ ...s, status: 'pending' })));
     setProgress(0);
     setQuipIdx(0);
-
     advanceStep(0, 'active');
 
-    const formData = new FormData();
-    formData.append('project_name', projectName || 'Untitled Project');
-    for (const { file } of files) formData.append('files', file);
+    // One review covers one drawing set, and a set is one file: the sheet
+    // inventory comes from inside the document. Merging separate files would
+    // make a conflict between two unrelated buildings look real.
+    const { file } = files[0];
+    if (files.length > 1) {
+      setError(`Only ${file.name} will be reviewed. Review each drawing set separately.`);
+    }
 
     try {
-      advanceStep(0, 'done');
-      advanceStep(1, 'active');
-
-      const res = await fetch('/api/analyze', {
+      // 1. A signed URL, so the drawing goes straight to storage. Through the
+      //    API it would be capped at 4.5 MB, and real permit sets are bigger.
+      const prep = await fetch('/api/analyze/upload', {
         method: 'POST',
-        body: formData,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fileName: file.name, projectName: projectName || 'Untitled Project' }),
       });
+      const up = await prep.json().catch(() => ({}));
+      if (!prep.ok) throw new Error(up?.detail || up?.error || `Upload could not start (${prep.status})`);
 
-      advanceStep(1, 'done');
-      advanceStep(2, 'done');
-      advanceStep(3, 'active');
+      // 2. Upload.
+      const { error: upErr } = await createSupabaseBrowserClient()
+        .storage.from('plans')
+        .uploadToSignedUrl(up.storagePath, up.token, file, { contentType: file.type || 'application/octet-stream' });
+      if (upErr) throw new Error(`Upload failed: ${upErr.message}`);
+      setProgress(3);
 
-      if (!res.ok) {
-        const detail = await res.json().catch(() => ({}));
-        throw new Error(detail?.error || `Analysis failed (${res.status})`);
-      }
-      const json = (await res.json()) as ApiResult;
-      advanceStep(3, 'done');
-      advanceStep(4, 'done');
-      setProgress(100);
-      setResult(json);
+      // 3. Start the background review and follow it.
+      const startRes = await fetch('/api/analyze', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ planId: up.planId, storagePath: up.storagePath, fileName: file.name }),
+      });
+      const started = await startRes.json().catch(() => ({}));
+      if (!startRes.ok) throw new Error(started?.error || `The review could not start (${startRes.status})`);
+      setPlanInUrl(up.planId);
+      await follow(up.planId);
     } catch (err) {
       setError((err as Error).message);
       setProgress(0);
-      setSteps((prev) =>
-        prev.map((s) => (s.status === 'active' ? { ...s, status: 'pending' } : s)),
-      );
+      setSteps((prev) => prev.map((s) => (s.status === 'active' ? { ...s, status: 'pending' } : s)));
     } finally {
       setAnalyzing(false);
     }
@@ -631,7 +712,11 @@ function PipelineTable({ steps }: { steps: PipelineStep[] }) {
                   : 'text-muted-foreground'
             }`}
           >
-            {step.status === 'done' ? 'Done' : step.status === 'active' ? 'Running…' : 'Pending'}
+            {step.status === 'done'
+              ? 'Done'
+              : step.status === 'active'
+                ? step.detail ?? 'Running…'
+                : 'Pending'}
           </span>
         </div>
       ))}
