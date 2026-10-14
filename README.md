@@ -271,7 +271,7 @@ an educational-use licence and is for internal testing only.
 
 ### No model is trained or fine-tuned
 
-Planq uses Anthropic's Claude models as they come, through the API. There is no
+Planq uses hosted models as they come, through OpenRouter. There is no
 fine-tuning, no custom model weights and no training run. Nothing a client
 uploads is used to train any model.
 
@@ -317,9 +317,10 @@ Tuning means changing the system, not the model:
 - **Prompts** get revised when a stage misreads something. Each revision gets a
   new prompt version so its effect can be traced.
 - **Guardrails** get added when a failure mode is found, so it cannot recur.
-- **Model routing** is in one place (`lib/claude.ts`): Haiku for applicability,
-  Sonnet for extraction and judgment, Opus for verification. A stage can be
-  moved to a different model without touching its prompt.
+- **Model routing** is in one place (`lib/claude.ts`), through OpenRouter: a
+  small model for applicability, a low-cost vision model for extraction, and a
+  stronger, different model for verification. A stage can be moved to another
+  model with an environment variable, without touching its prompt.
 
 ### How Planq will learn from use
 
@@ -389,7 +390,7 @@ workflows/review.ts         the review as a durable workflow (one step per sheet
   sign-in/, sign-up/        Clerk auth pages
 lib/
   review.ts                 the pipeline stages (S0 to S4), shared by the workflow and the CLI
-  claude.ts                 Anthropic client, model routing, prices, run budgets
+  claude.ts                 OpenRouter client, per-stage model routing, prices, run budgets
   schemas.ts                zod schemas: Fact, Finding, Rule, Applicability, audit
   intake/                   S0: sheets, rendering, legend reading, text-layer facts
   stages/                   S1 applicability, S2 vision, S4 verify, S5 report, runner
@@ -422,8 +423,10 @@ npm run dev                        # http://localhost:3000
 
 | Variable | Purpose |
 | --- | --- |
-| `ANTHROPIC_API_KEY` | Claude API key. Every stage uses it. |
-| `ANTHROPIC_WORKSPACE_ID` | Needed only if the key is organization-scoped. Must be the `wrkspc_` id, not the organization UUID. |
+| `OPENROUTER_API_KEY` | OpenRouter API key. Every model call uses it. |
+| `PLANQ_MODEL_APPLICABILITY`, `PLANQ_MODEL_EXTRACTION`, `PLANQ_MODEL_VERIFIER` | Optional. Override the OpenRouter model for a stage; defaults are in `lib/claude.ts`. |
+| `PLANQ_REASONING_EFFORT` | Optional. `low`, `medium` (default), `high`, or `off` for a model with no reasoning mode. |
+| `PLANQ_DATA_COLLECTION` | Optional. Defaults to `deny`, so drawings only go to providers that do not train on prompts. Set `allow` if a model has no such endpoint. |
 | `NEXT_PUBLIC_SUPABASE_URL` | Supabase project URL. |
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Supabase public key. |
 | `SUPABASE_SERVICE_ROLE_KEY` | Server-side Supabase access for storing uploads and findings. |
@@ -497,9 +500,13 @@ if it goes over budget (G11). Budgets are in `lib/claude.ts`.
 | 2-sheet house | about $0.44 in 5 model calls | $1.50 |
 | 25-sheet permit set | not yet measured | $12 |
 
-Prices used (per million tokens, input / output): Haiku 4.5 $1 / $5, Sonnet 5
-$2 / $10, Opus 5 $5 / $25. Prompt caching is on for system prompts. Check
-Anthropic's pricing page before quoting clients.
+Cost per call is the figure OpenRouter reports on each response; the price table
+in `lib/claude.ts` is only a fallback. Default models (per million tokens, input
+/ output): Haiku 5.5 $0.10 / $0.50 for applicability, Qwen3.8 Omni Flash
+$0.15 / $0.47 for extraction, Sonnet 5.5 $2 / $10 for the verifier. The
+measured figure above predates the OpenRouter switch. Prompt caching is on for
+system prompts where the provider supports it. Check OpenRouter's model page
+before quoting clients.
 
 ---
 

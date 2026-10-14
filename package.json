@@ -16,7 +16,6 @@
     "test:verifier": "ts-node --project tsconfig.scripts.json scripts/verifier-test.ts"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.70.1",
     "@clerk/nextjs": "^6.39.5",
     "@napi-rs/canvas": "^0.1.100",
     "@supabase/ssr": "^0.10.3",
