@@ -71,11 +71,40 @@ upload
   -> human sign-off
 ```
 
-Everything runs from one orchestrator, `lib/review.ts`. The web route
-(`app/api/analyze/route.ts`) and the command line (`npm run review`) both call
-it, so there is exactly one pipeline. Independent model calls run at the same time (both extraction passes, every
-sheet, and up to four verifier checks), which keeps a two-sheet review at about
-1.5 to 3 minutes. Every stage reads and writes JSON that is
+### Reviews run in the background
+
+A review is too much work for one web request. A 26-sheet set needs about 52
+vision calls plus a verifier call for every proposed failure, and a Vercel
+function is stopped at 300 seconds. Inside one request a large set either
+failed with a 504 or had to skip sheets and the independent check, and a
+review that skips evidence is not one anyone can defend.
+
+So a review is a durable workflow (`workflows/review.ts`, Vercel Workflow):
+
+```
+browser --signed URL--> Supabase Storage        (the file never passes through the API)
+browser --POST /api/analyze--> start workflow   (returns at once)
+browser --GET /api/analyze/[planId] every 3 s--> progress, then the result
+
+workflow
+  prepare   S0 + S1                                    one step
+  read      S2, one sheet per step, 8 at a time        every sheet
+  rules     S3                                         one step
+  verify    S4, one finding per step, 4 at a time      every proposed failure
+  save      findings, result, status -> Supabase       one step
+```
+
+Each step has its own time limit and retries on its own: a rate-limited or
+overloaded API call waits a minute and tries again instead of losing the
+sheet. A sheet or a check that still fails after its retries is recorded in
+the report, never dropped silently. Progress is real (stage, and "sheet 14 of
+26"), the plan id is in the page URL so a reload picks the review back up, and
+closing the tab does not stop it.
+
+The stages themselves are plain functions in `lib/review.ts`, shared by the
+workflow and the command line (`npm run review`), so there is exactly one
+pipeline. Model calls are capped at 16 in flight per instance, which keeps
+well inside the API's token rate limit. Every stage reads and writes JSON that is
 validated against a zod schema. If validation fails, the stage retries once with
 the error attached, and then the run stops as `needs_manual_review` instead of
 guessing.
@@ -87,7 +116,9 @@ guessing.
   sized so dimension text is legible).
 - Builds a sheet inventory: number, title, scale, units, size. "Not to scale" is
   flagged. Dual-unit sheets (`10.00 m [32'-9 3/4"]`) are detected so an imperial
-  figure is never read as metric, which would be a 3.28× error.
+  figure is never read as metric, which would be a 3.28× error. Imperial sets
+  are supported: feet and inches (`4'-5 3/4"`), the door tag shorthand `2/8`
+  (2'-8") and areas in ft² are converted in code, never by the model.
 - **Reads the sheet's own legend** (`legend.ts`). Drawings declare their own
   notation: one set writes `N.P.T.` for floor level, another writes `T/O SLAB`
   or `F.F.E.`. Planq learns the notation from each set instead of hardcoding
@@ -240,7 +271,7 @@ an educational-use licence and is for internal testing only.
 
 ### No model is trained or fine-tuned
 
-Planq uses Anthropic's Claude models as they come, through the API. There is no
+Planq uses hosted models as they come, through OpenRouter. There is no
 fine-tuning, no custom model weights and no training run. Nothing a client
 uploads is used to train any model.
 
@@ -286,9 +317,16 @@ Tuning means changing the system, not the model:
 - **Prompts** get revised when a stage misreads something. Each revision gets a
   new prompt version so its effect can be traced.
 - **Guardrails** get added when a failure mode is found, so it cannot recur.
-- **Model routing** is in one place (`lib/claude.ts`): Haiku for applicability,
-  Sonnet for extraction and judgment, Opus for verification. A stage can be
-  moved to a different model without touching its prompt.
+- **Model routing** is in one place (`lib/claude.ts`), through OpenRouter: a
+  small model for applicability, a low-cost vision model for extraction, and a
+  stronger, different model for verification. A stage can be moved to another
+  model with an environment variable, without touching its prompt.
+- **Running out of credit does not stop reviews.** Each stage has fallback
+  models OpenRouter tries when its model is unavailable. When OpenRouter itself
+  is out of credit or over a key cap, calls go straight to the Claude API. If
+  both are exhausted, a background review waits and retries every 30 minutes
+  for two hours, so a top-up resumes it; after that it fails with an
+  out-of-credit message rather than reporting every sheet as unreadable.
 
 ### How Planq will learn from use
 
@@ -351,11 +389,14 @@ rules exist behind them yet, so such a building produces no findings.
 ```
 app/
   page.tsx                  upload UI and five-status findings view
-  api/analyze/route.ts      POST endpoint: stores the upload, runs lib/review.ts
+  api/analyze/upload/       creates the plan and a signed upload URL
+  api/analyze/route.ts      starts the review workflow
+  api/analyze/[planId]/     progress while it runs, then the result
+workflows/review.ts         the review as a durable workflow (one step per sheet and per finding)
   sign-in/, sign-up/        Clerk auth pages
 lib/
-  review.ts                 the one pipeline orchestrator (S0 to S4)
-  claude.ts                 Anthropic client, model routing, prices, run budgets
+  review.ts                 the pipeline stages (S0 to S4), shared by the workflow and the CLI
+  claude.ts                 OpenRouter client, per-stage model routing, prices, run budgets
   schemas.ts                zod schemas: Fact, Finding, Rule, Applicability, audit
   intake/                   S0: sheets, rendering, legend reading, text-layer facts
   stages/                   S1 applicability, S2 vision, S4 verify, S5 report, runner
@@ -388,8 +429,12 @@ npm run dev                        # http://localhost:3000
 
 | Variable | Purpose |
 | --- | --- |
-| `ANTHROPIC_API_KEY` | Claude API key. Every stage uses it. |
-| `ANTHROPIC_WORKSPACE_ID` | Needed only if the key is organization-scoped. Must be the `wrkspc_` id, not the organization UUID. |
+| `OPENROUTER_API_KEY` | OpenRouter API key. Every model call goes through it first. |
+| `PLANQ_MODEL_APPLICABILITY`, `PLANQ_MODEL_EXTRACTION`, `PLANQ_MODEL_VERIFIER` | Optional. Override the OpenRouter model for a stage; defaults are in `lib/claude.ts`. |
+| `PLANQ_REASONING_EFFORT` | Optional. `low`, `medium` (default), `high`, or `off` for a model with no reasoning mode. |
+| `PLANQ_DATA_COLLECTION` | Optional. Defaults to `deny`, so drawings only go to providers that do not train on prompts. Set `allow` if a model has no such endpoint. |
+| `PLANQ_FALLBACK_<STAGE>` | Optional. Comma-separated fallback models for a stage, or `none`; defaults are in `lib/claude.ts`. |
+| `ANTHROPIC_API_KEY`, `ANTHROPIC_WORKSPACE_ID` | Optional but recommended. The Claude API, used directly when OpenRouter is out of credit. The workspace id is needed for a key not scoped to one workspace. |
 | `NEXT_PUBLIC_SUPABASE_URL` | Supabase project URL. |
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Supabase public key. |
 | `SUPABASE_SERVICE_ROLE_KEY` | Server-side Supabase access for storing uploads and findings. |
@@ -422,15 +467,24 @@ Vercel deploys `main` to production automatically
 
 Things that have broken deploys before, so they are set up deliberately:
 
-- **Function duration.** `/api/analyze` sets `maxDuration = 300`, the most the
-  Hobby plan allows. A review that runs longer is cut off with a 504. Measured
-  locally: 94 s for the scanned sample, 176 s for Chesnut. Upgrading to Pro
-  allows up to 800 seconds; running reviews as background jobs removes the
-  limit.
+- **Reviews are workflows, not requests.** No review has to fit in one
+  function's time limit; each step does. `next.config.js` is wrapped in
+  `withWorkflow`, and the middleware matcher excludes `/.well-known/workflow/`,
+  which the workflow runtime calls internally.
+- **Uploads go straight to storage.** Vercel caps a request body at 4.5 MB, so
+  the browser uploads to Supabase Storage with a signed URL from
+  `/api/analyze/upload`.
+- **Database reads are never cached.** Next.js 14 caches `fetch()` in route
+  handlers, and supabase-js reads through it; the status route served a stale
+  "S1" for a finished review until `lib/supabase.ts` forced `no-store`.
 - **Files read at runtime must be bundled.** `next.config.js` lists them under
-  `outputFileTracingIncludes`: the pdfjs worker, `data/code-store.json`, and
+  `outputFileTracingIncludes`, for both `/api/analyze` and the workflow route
+  `/.well-known/workflow/v1/flow`, where every step runs: the pdfjs worker, `data/code-store.json`,
   `@napi-rs/canvas` (which pdfjs needs on a server and loads in a way the
-  bundler cannot see). If a review fails on Vercel but works locally, a missing
+  bundler cannot see), and pdfjs's `standard_fonts` and `cmaps`. Without the
+  fonts, a CAD export that does not embed Arial renders with every dimension
+  blank and the vision pass silently reads nothing; `renderSheet` now refuses
+  to run if they are missing. If a review fails on Vercel but works locally, a missing
   file here is the first thing to check.
 - **The clause store is committed.** The rest of `data/` is gitignored, but
   `data/code-store.json` is tracked because there is no code PDF on Vercel to
@@ -454,9 +508,13 @@ if it goes over budget (G11). Budgets are in `lib/claude.ts`.
 | 2-sheet house | about $0.44 in 5 model calls | $1.50 |
 | 25-sheet permit set | not yet measured | $12 |
 
-Prices used (per million tokens, input / output): Haiku 4.5 $1 / $5, Sonnet 5
-$2 / $10, Opus 5 $5 / $25. Prompt caching is on for system prompts. Check
-Anthropic's pricing page before quoting clients.
+Cost per call is the figure OpenRouter reports on each response; the price table
+in `lib/claude.ts` is only a fallback. Default models (per million tokens, input
+/ output): Haiku 5.5 $0.10 / $0.50 for applicability, Qwen3.8 Omni Flash
+$0.15 / $0.47 for extraction, Sonnet 5.5 $2 / $10 for the verifier. The
+measured figure above predates the OpenRouter switch. Prompt caching is on for
+system prompts where the provider supports it. Check OpenRouter's model page
+before quoting clients.
 
 ---
 

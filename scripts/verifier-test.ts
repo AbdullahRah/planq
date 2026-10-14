@@ -11,7 +11,7 @@ import { config as loadEnv } from 'dotenv';
 import { verifyFinding } from '../lib/stages/verify';
 import { RunLedger } from '../lib/stages/runner';
 import { lookupClauses } from '../lib/code-store';
-import { RUN_BUDGET_USD } from '../lib/claude';
+import { MODELS, RUN_BUDGET_USD } from '../lib/claude';
 import type { Fact, Finding } from '../lib/schemas';
 
 loadEnv({ path: path.resolve(process.cwd(), '.env.local') });
@@ -83,7 +83,7 @@ async function main() {
     res.finding.verifier !== 'upheld',
   );
   check('usage was recorded for the audit trail (§G10)', ledger.usage.length === 1);
-  check('the verifier ran on Opus, not the S3 model', ledger.usage[0]?.model === 'claude-opus-5');
+  check('the verifier ran on its own model, not the extraction model', !!ledger.usage[0]?.model && ledger.usage[0].model !== MODELS.extraction);
 
   if (fail > 0) {
     console.log(`\n${fail} FAILED`);

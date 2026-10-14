@@ -10,7 +10,7 @@
 // token counts, prompt versions and cost, which is what §G10 asks for.
 
 import type { z } from 'zod';
-import { anthropic, costOf, MODELS, type StageName } from '../claude';
+import { chat, costOf, MODELS, type StageName } from '../claude';
 import { validateStage, type StageUsage } from '../schemas';
 
 export class BudgetExceededError extends Error {
@@ -18,6 +18,32 @@ export class BudgetExceededError extends Error {
     super(`run budget exceeded: $${spent.toFixed(4)} spent against a $${budget.toFixed(2)} ceiling`);
     this.name = 'BudgetExceededError';
   }
+}
+
+/**
+ * At most this many model calls in flight across the whole process. A 26-sheet
+ * set fired 52 vision calls at once, went past the organization's 500 000 input
+ * tokens per minute, and nine sheets came back as 429s. A vision call is about
+ * 17 000 input tokens and takes one to two minutes, so 16 at once is about
+ * 270 000 tokens a minute: inside the limit, with headroom for a second review
+ * running at the same time.
+ */
+const MAX_CONCURRENT_CALLS = Number(process.env.PLANQ_MAX_CONCURRENT_CALLS) || 16;
+let inFlight = 0;
+const waiting: Array<() => void> = [];
+
+async function acquireSlot(): Promise<void> {
+  if (inFlight < MAX_CONCURRENT_CALLS) {
+    inFlight += 1;
+    return;
+  }
+  await new Promise<void>((resolve) => waiting.push(resolve));
+}
+
+function releaseSlot(): void {
+  const next = waiting.shift();
+  if (next) next(); // hand the slot straight over
+  else inFlight -= 1;
 }
 
 export class StageFailedError extends Error {
@@ -77,16 +103,34 @@ export interface StageCall<T extends z.ZodTypeAny> {
    */
   jsonSchema: Record<string, unknown>;
   maxTokens?: number;
-  /** Adaptive thinking is wrong for Haiku 4.5, which still takes a budget. */
+  /**
+   * Ask the model to reason before answering. Sent as OpenRouter's unified
+   * `reasoning` setting; strength comes from PLANQ_REASONING_EFFORT.
+   */
   thinking?: boolean;
   ledger: RunLedger;
 }
 
-function textOf(blocks: Array<{ type: string; text?: string }>): string {
-  return blocks
-    .filter((b) => b.type === 'text' && typeof b.text === 'string')
-    .map((b) => b.text as string)
-    .join('');
+/** Our content blocks, in the OpenAI-style parts OpenRouter takes. */
+function toOpenRouterPart(block: ContentBlock): Record<string, unknown> {
+  if (block.type === 'text') return block;
+  return {
+    type: 'image_url',
+    image_url: { url: `data:${block.source.media_type};base64,${block.source.data}` },
+  };
+}
+
+/**
+ * Some models wrap JSON in a code fence or add a sentence around it even when a
+ * schema is set. Take the outermost object so a harmless wrapper does not cost a
+ * retry. Anything that still fails to parse goes through the §4 retry path.
+ */
+function extractJson(raw: string): string {
+  const s = raw.trim();
+  if (s.startsWith('{') && s.endsWith('}')) return s;
+  const first = s.indexOf('{');
+  const last = s.lastIndexOf('}');
+  return first >= 0 && last > first ? s.slice(first, last + 1) : s;
 }
 
 /**
@@ -107,49 +151,70 @@ export async function runStage<T extends z.ZodTypeAny>(
     const body: Record<string, unknown> = {
       model,
       max_tokens: call.maxTokens ?? 8000,
-      system: [
-        // The system prompt and the rule text are identical across every sheet
-        // and every run, so caching them is where §10's cost targets come from.
-        { type: 'text', text: call.system, cache_control: { type: 'ephemeral' } },
+      messages: [
+        {
+          role: 'system',
+          // The system prompt and the rule text are identical across every sheet
+          // and every run, so caching them is where §10's cost targets come
+          // from. OpenRouter forwards cache_control to providers that support it
+          // and ignores it for the rest.
+          content: [{ type: 'text', text: call.system, cache_control: { type: 'ephemeral' } }],
+        },
+        { role: 'user', content: content.map(toOpenRouterPart) },
       ],
-      messages: [{ role: 'user', content }],
-      output_config: { format: { type: 'json_schema', schema: call.jsonSchema } },
+      response_format: {
+        type: 'json_schema',
+        json_schema: { name: 'stage_output', strict: true, schema: call.jsonSchema },
+      },
+      // Ask for the dollar cost of the call, which the audit trail records.
+      usage: { include: true },
+      provider: {
+        // Only route to endpoints that honour every parameter sent, above all
+        // the JSON schema. Without this a provider can silently ignore it.
+        require_parameters: true,
+        // Client drawings must not be used for training (README, "No model is
+        // trained"). Set PLANQ_DATA_COLLECTION=allow to widen the provider
+        // pool if a model has no endpoint that satisfies this.
+        data_collection: process.env.PLANQ_DATA_COLLECTION?.trim() === 'allow' ? 'allow' : 'deny',
+      },
     };
 
     if (call.thinking) {
-      // Haiku 4.5 predates adaptive thinking and rejects it; the 5-series
-      // models reject budget_tokens. Route by model, not by preference.
-      body.thinking =
-        model === 'claude-haiku-4-5'
-          ? { type: 'enabled', budget_tokens: 2048 }
-          : { type: 'adaptive' };
+      const effort = (process.env.PLANQ_REASONING_EFFORT?.trim() || 'medium').toLowerCase();
+      // 'off' omits the parameter, for a model that has no reasoning mode.
+      if (effort !== 'off') body.reasoning = { effort };
     }
 
-    const res = await (anthropic as unknown as {
-      messages: { create(b: unknown): Promise<Record<string, unknown>> };
-    }).messages.create(body);
+    await acquireSlot();
+    let res: Awaited<ReturnType<typeof chat>>;
+    try {
+      res = await chat(body, call.stage);
+    } finally {
+      releaseSlot();
+    }
 
-    const usage = (res.usage ?? {}) as {
-      input_tokens?: number;
-      output_tokens?: number;
-      cache_read_input_tokens?: number;
-    };
+    const usage = res.usage;
     call.ledger.record({
       stage: `${call.stage}${attempt > 1 ? ' (retry)' : ''}`,
-      model,
-      input_tokens: usage.input_tokens ?? 0,
-      output_tokens: usage.output_tokens ?? 0,
-      cache_read_input_tokens: usage.cache_read_input_tokens ?? 0,
-      cost_usd: costOf(model, usage),
+      model: res.servedModel ?? model,
+      input_tokens: usage.input_tokens,
+      output_tokens: usage.output_tokens,
+      cache_read_input_tokens: usage.cache_read_input_tokens,
+      // OpenRouter's reported cost is the number of record; the price table is
+      // only a fallback for a response that carries none.
+      cost_usd: usage.cost_usd ?? costOf(model, usage),
       prompt_version: call.promptVersion,
     });
 
-    const raw = textOf(res.content as Array<{ type: string; text?: string }>);
+    const raw = res.content;
     let parsed: unknown;
     try {
-      parsed = JSON.parse(raw);
+      parsed = JSON.parse(extractJson(raw));
     } catch {
-      lastError = `response was not valid JSON: ${raw.slice(0, 200)}`;
+      lastError =
+        res.finishReason === 'length'
+          ? 'the reply was cut off at the token limit before the JSON finished'
+          : `response was not valid JSON: ${raw.slice(0, 200)}`;
       content = [
         ...call.content,
         { type: 'text', text: `Your previous reply could not be parsed. ${lastError}. Return only JSON matching the schema.` },

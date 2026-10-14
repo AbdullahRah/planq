@@ -16,7 +16,7 @@ import { convert } from '../engine/units';
 import { MODELS } from '../claude';
 import { runStage, type ContentBlock, type RunLedger } from './runner';
 
-const PROMPT_VERSION = 's1-2026-10-06';
+const PROMPT_VERSION = 's1-2026-10-06b';
 
 /** What the model is asked for: observations, not the verdict. */
 const ObservationsSchema = z.object({
@@ -29,7 +29,7 @@ const ObservationsSchema = z.object({
    * area, the model returned the 200 m2 lot ("WIDTH 10.00 m, LENGTH 20.00 m,
    * TOTAL AREA 200.00 m2") instead of the largest storey.
    */
-  storey_areas: z.array(z.object({ label: z.string(), area_m2: z.number().min(0) })),
+  storey_areas: z.array(z.object({ label: z.string(), area: z.number().min(0), unit: z.string() })),
   /**
    * Overall extents of each floor plan, as printed. Most house sets carry no
    * area schedule, and S1 used to stop on every one of them. The rectangle
@@ -72,8 +72,8 @@ const OBSERVATIONS_JSON_SCHEMA = {
       items: {
         type: 'object',
         additionalProperties: false,
-        properties: { label: { type: 'string' }, area_m2: { type: 'number' } },
-        required: ['label', 'area_m2'],
+        properties: { label: { type: 'string' }, area: { type: 'number' }, unit: { type: 'string' } },
+        required: ['label', 'area', 'unit'],
       },
     },
     overall_extents: {
@@ -121,7 +121,7 @@ const SYSTEM = `You read building drawings and report what they state about the 
 
 Report only what the sheets state. Rules:
 
-1. storey_areas lists one entry per storey the area schedule gives a figure for, using the schedule's own label, for example "GROUND FLOOR" or "FIRST LEVEL". Copy the figures; do not add them up and do not pick a winner. The building area is computed from this list, not by you.
+1. storey_areas lists one entry per storey the area schedule gives a figure for, using the schedule's own label, for example "GROUND FLOOR" or "FIRST LEVEL". Copy each figure and its unit exactly as printed into area and unit, for example 584.00 and "ft2", or 87.82 and "m2". Do not convert units, do not add figures up and do not pick a winner. The building area is computed from this list, not by you.
 2. Only list a row in storey_areas when it names a storey of the building. A garden, a lot, a site, a yard or a terrace is not a storey; leave those out.
 3. site_area_m2 is the LOT or SITE area, the area of the property. It is a different thing from the area of the building and the two are easy to confuse: a schedule that prints "WIDTH 10.00 m", "LENGTH 20.00 m" and "TOTAL AREA 200.00 m2" is describing the lot, not the building. If the sheets give a lot area, put it here and nowhere else.
 4. storeys_above_grade counts storeys above grade only. A basement listed at zero area is not a storey. If no sheet states a storey count, count the floor plans of storeys above grade (a ground floor plan and a second floor plan are two storeys; a basement plan is none) and say so in evidence.
@@ -216,8 +216,9 @@ export async function determineApplicability(
     system: SYSTEM,
     schema: ObservationsSchema,
     jsonSchema: OBSERVATIONS_JSON_SCHEMA,
-    // Images and adaptive thinking together ran past 4 000 and forced a retry.
-    maxTokens: images.length > 0 ? 16000 : 4000,
+    // Images with adaptive thinking, or a 26-sheet set of text, ran past 4 000
+    // output tokens and forced a retry that came back empty.
+    maxTokens: images.length > 0 ? 16000 : 10000,
     thinking: true,
     ledger,
     content: [
@@ -238,7 +239,19 @@ export async function determineApplicability(
   // which 1.3.3.3.(1)'s 600 m2 limit is measured against. Computed here from
   // the per-storey figures so the model never has to distinguish it from the
   // total floor area or from the lot.
-  const occupiedStoreys = obs.storey_areas.filter((s) => s.area_m2 > 0);
+  // Units are converted here, not by the model (§G4). A Calgary set printed
+  // 584.00 FT2 and the model, left to convert, alternated between the right
+  // 54.3 m2 and an unrelated 266.28 m2 from the same schedule.
+  const storeyAreas = obs.storey_areas.flatMap((s) => {
+    let m2: number | null = null;
+    try {
+      m2 = convert(s.area, s.unit, 'm2');
+    } catch {
+      m2 = null; // a length, not an area
+    }
+    return m2 == null ? [] : [{ label: s.label, area_m2: Math.round(m2 * 100) / 100 }];
+  });
+  const occupiedStoreys = storeyAreas.filter((s) => s.area_m2 > 0);
   const scheduledArea = occupiedStoreys.length > 0
     ? Math.max(...occupiedStoreys.map((s) => s.area_m2))
     : 0;
@@ -344,10 +357,10 @@ export async function determineApplicability(
   // The worst case is the most conservative one: every area row counted toward
   // the footprint, and every row counted as a storey.
   const worstCaseArea = Math.max(
-    obs.storey_areas.reduce((a, s) => a + s.area_m2, 0),
+    storeyAreas.reduce((a, s) => a + s.area_m2, 0),
     boundingArea,
   );
-  const worstCaseStoreys = Math.max(obsStoreys, obs.storey_areas.length);
+  const worstCaseStoreys = Math.max(obsStoreys, storeyAreas.length);
   const conflictCouldFlipThePart =
     worstCaseArea > PART9_MAX_BUILDING_AREA_M2 || worstCaseStoreys > PART9_MAX_STOREYS;
 

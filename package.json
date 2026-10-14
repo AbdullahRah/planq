@@ -13,7 +13,8 @@
     "verify:rules": "ts-node --project tsconfig.scripts.json scripts/verify-rules.ts",
     "test:engine": "ts-node --project tsconfig.scripts.json scripts/engine-test.ts",
     "review": "ts-node --project tsconfig.scripts.json scripts/review.ts",
-    "test:verifier": "ts-node --project tsconfig.scripts.json scripts/verifier-test.ts"
+    "test:verifier": "ts-node --project tsconfig.scripts.json scripts/verifier-test.ts",
+    "bench:vision": "ts-node --project tsconfig.scripts.json scripts/vision-bench.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.70.1",
@@ -28,6 +29,7 @@
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "sharp": "^0.33.5",
+    "workflow": "^5.1.0",
     "zod": "^3.25.76"
   },
   "devDependencies": {

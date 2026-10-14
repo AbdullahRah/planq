@@ -9,7 +9,7 @@
 import path from 'path';
 import { config as loadEnv } from 'dotenv';
 import { evaluate, resetFindingIds } from '../lib/engine/evaluate';
-import { convert } from '../lib/engine/units';
+import { convert, parseDoorTag, parseImperial } from '../lib/engine/units';
 import { PART9_RULES, ruleById } from '../lib/rules/part9';
 import {
   type Applicability,
@@ -93,6 +93,30 @@ function main() {
       return true;
     }
   })());
+
+  console.log('\nImperial:');
+  const near = (a: number | null, b: number) => a != null && Math.abs(a - b) < 0.5;
+  ok(`4'-5 3/4" is 1365 mm`, near(parseImperial(`4'-5 3/4"`), 1365.25));
+  ok(`4'-5¾" is 1365 mm`, near(parseImperial(`4'-5¾"`), 1365.25));
+  ok(`9'-1" is 2769 mm`, near(parseImperial(`9'-1"`), 2768.6));
+  ok(`32" is 813 mm`, near(parseImperial(`32"`), 812.8));
+  ok(`2' is 610 mm`, near(parseImperial(`2'`), 609.6));
+  ok('a bare number is not imperial', parseImperial('800') === null);
+  ok('door tag 2/8 is 813 mm', near(parseDoorTag('2/8'), 812.8));
+  ok('door tag 2/0 is 610 mm', near(parseDoorTag('2/0'), 609.6));
+  ok('0/8 is not a door tag', parseDoorTag('0/8') === null);
+  ok('7/12 is not a door tag', parseDoorTag('7/12') === null);
+  ok('2/14 is not a door tag', parseDoorTag('2/14') === null);
+  ok('ft to mm', convert(1, 'ft', 'mm') === 304.8);
+  resetFindingIds();
+  const imp = evaluate({
+    rules: PART9_RULES,
+    facts: [drawingFact('d-imp', 'door_width_mm', '2/8', undefined, 'door into bedroom', '10', '2/8', true, 'bedroom')],
+    negative: [],
+    applicability: CHESNUT_APP,
+  });
+  const impF = imp.findings.find((f) => f.fact_ids.includes('d-imp'));
+  ok('a 2/8 bedroom door passes 760 mm', impF?.status === 'pass' && impF?.computed.measured === 812.8, `${impF?.status} ${impF?.computed.measured}`);
 
   console.log('\nStatus downgrade (§G7):');
   ok('fail downgrades to needs_confirmation', downgrade('fail') === 'needs_confirmation');
@@ -291,6 +315,22 @@ function main() {
   const missingSmoke = out.findings.find((f) => f.rule_id === 'smoke-alarms');
   ok('a cant_determine asks for the missing information', /^Show smoke alarm locations/.test(missingSmoke?.required_action ?? ''), missingSmoke?.required_action);
   ok('a shortfall still asks for the fix', /Raise the guard/.test(byRule('guard-height')[0]?.required_action ?? ''));
+
+  console.log('\nStair consistency groups flights:');
+  resetFindingIds();
+  const rc = (id: string, v: number, sheet: string) => drawingFact(id, 'riser_count', v, undefined, 'stair', sheet, `${v}R`);
+  const slip = evaluate({ rules: [ruleById('stair-consistency')!], facts: [rc('a', 16, '01'), rc('b', 17, '02')], negative: [], applicability: CHESNUT_APP });
+  ok('16 on the plan and 17 on the section is a drawing conflict', slip.findings.length === 1 && slip.findings[0].status === 'drawing_conflict');
+  resetFindingIds();
+  const two = evaluate({
+    rules: [ruleById('stair-consistency')!],
+    facts: [rc('m1', 15, '10'), rc('m2', 15, '11'), rc('m3', 15, '17'), rc('d1', 8, '20')],
+    negative: [],
+    applicability: CHESNUT_APP,
+  });
+  ok('a main stair of 15 and a deck stair of 8 are not a conflict', two.findings.every((f) => f.status !== 'drawing_conflict'), two.findings.map((f) => f.status).join(','));
+  ok('the main stair agreeing across three sheets passes', two.findings.some((f) => f.status === 'pass' && f.computed.agreed === 15));
+  ok('the deck stair on one sheet cannot be cross-checked', two.findings.some((f) => f.status === 'cant_determine' && f.fact_ids.includes('d1')));
 
   console.log('\nCeiling height skips outdoor spaces:');
   resetFindingIds();

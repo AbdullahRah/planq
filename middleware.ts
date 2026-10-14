@@ -12,7 +12,9 @@ export default clerkMiddleware(async (_auth, request) => {
 export const config = {
   matcher: [
     // Everything except static assets and image optimization.
-    '/((?!_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp|ico)$).*)',
+    // Workflow's internal routes are excluded: the middleware rewrites the
+    // request and breaks the runtime's queue delivery.
+    '/((?!_next/static|_next/image|favicon.ico|\\.well-known/workflow/|.*\\.(?:svg|png|jpg|jpeg|gif|webp|ico)$).*)',
     // Always run for API routes.
     '/(api|trpc)(.*)',
   ],
