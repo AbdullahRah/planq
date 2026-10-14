@@ -13,9 +13,11 @@
     "verify:rules": "ts-node --project tsconfig.scripts.json scripts/verify-rules.ts",
     "test:engine": "ts-node --project tsconfig.scripts.json scripts/engine-test.ts",
     "review": "ts-node --project tsconfig.scripts.json scripts/review.ts",
-    "test:verifier": "ts-node --project tsconfig.scripts.json scripts/verifier-test.ts"
+    "test:verifier": "ts-node --project tsconfig.scripts.json scripts/verifier-test.ts",
+    "bench:vision": "ts-node --project tsconfig.scripts.json scripts/vision-bench.ts"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.70.1",
     "@clerk/nextjs": "^6.39.5",
     "@napi-rs/canvas": "^0.1.100",
     "@supabase/ssr": "^0.10.3",

@@ -10,7 +10,7 @@
 // token counts, prompt versions and cost, which is what §G10 asks for.
 
 import type { z } from 'zod';
-import { costOf, MODELS, openrouterChat, type StageName } from '../claude';
+import { chat, costOf, MODELS, type StageName } from '../claude';
 import { validateStage, type StageUsage } from '../schemas';
 
 export class BudgetExceededError extends Error {
@@ -186,9 +186,9 @@ export async function runStage<T extends z.ZodTypeAny>(
     }
 
     await acquireSlot();
-    let res: Awaited<ReturnType<typeof openrouterChat>>;
+    let res: Awaited<ReturnType<typeof chat>>;
     try {
-      res = await openrouterChat(body);
+      res = await chat(body, call.stage);
     } finally {
       releaseSlot();
     }

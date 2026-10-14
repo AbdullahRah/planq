@@ -85,6 +85,9 @@ export async function reviewWorkflow(input: ReviewInput): Promise<{ status: stri
           readings.push(s.value);
           usage.push(...s.value.usage);
         } else {
+          // Still out of credit after waiting: fail the review rather than
+          // publish one where every sheet looks unreadable.
+          if (/model credit exhausted/.test(String(s.reason?.message ?? s.reason))) throw s.reason;
           // Out of retries. Recorded, never silently dropped: the report says
           // which sheet was read from its text layer only.
           readings.push({ sheet: batch[i], facts: [], negative: [], usage: [], error: String(s.reason?.message ?? s.reason) });
@@ -154,6 +157,12 @@ export async function reviewWorkflow(input: ReviewInput): Promise<{ status: stri
 function classify(err: unknown): never {
   const e = err as { status?: number; name?: string; message?: string };
   if (e?.name === 'BudgetExceededError') throw new FatalError(e.message ?? 'run budget exceeded');
+  // Out of credit on every provider. Waiting costs nothing in a workflow, so the
+  // step sleeps and tries again: a top-up within the retry window resumes the
+  // review where it stopped instead of failing it.
+  if (e?.name === 'CreditExhaustedError') {
+    throw new RetryableError(`model credit exhausted, waiting for a top-up: ${e.message}`, { retryAfter: '30m' });
+  }
   if (e?.status === 429 || e?.status === 529) {
     throw new RetryableError(`model API ${e.status === 429 ? 'rate limited' : 'overloaded'}: ${e.message}`, {
       retryAfter: '1m',

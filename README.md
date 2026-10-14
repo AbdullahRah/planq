@@ -321,6 +321,12 @@ Tuning means changing the system, not the model:
   small model for applicability, a low-cost vision model for extraction, and a
   stronger, different model for verification. A stage can be moved to another
   model with an environment variable, without touching its prompt.
+- **Running out of credit does not stop reviews.** Each stage has fallback
+  models OpenRouter tries when its model is unavailable. When OpenRouter itself
+  is out of credit or over a key cap, calls go straight to the Claude API. If
+  both are exhausted, a background review waits and retries every 30 minutes
+  for two hours, so a top-up resumes it; after that it fails with an
+  out-of-credit message rather than reporting every sheet as unreadable.
 
 ### How Planq will learn from use
 
@@ -423,10 +429,12 @@ npm run dev                        # http://localhost:3000
 
 | Variable | Purpose |
 | --- | --- |
-| `OPENROUTER_API_KEY` | OpenRouter API key. Every model call uses it. |
+| `OPENROUTER_API_KEY` | OpenRouter API key. Every model call goes through it first. |
 | `PLANQ_MODEL_APPLICABILITY`, `PLANQ_MODEL_EXTRACTION`, `PLANQ_MODEL_VERIFIER` | Optional. Override the OpenRouter model for a stage; defaults are in `lib/claude.ts`. |
 | `PLANQ_REASONING_EFFORT` | Optional. `low`, `medium` (default), `high`, or `off` for a model with no reasoning mode. |
 | `PLANQ_DATA_COLLECTION` | Optional. Defaults to `deny`, so drawings only go to providers that do not train on prompts. Set `allow` if a model has no such endpoint. |
+| `PLANQ_FALLBACK_<STAGE>` | Optional. Comma-separated fallback models for a stage, or `none`; defaults are in `lib/claude.ts`. |
+| `ANTHROPIC_API_KEY`, `ANTHROPIC_WORKSPACE_ID` | Optional but recommended. The Claude API, used directly when OpenRouter is out of credit. The workspace id is needed for a key not scoped to one workspace. |
 | `NEXT_PUBLIC_SUPABASE_URL` | Supabase project URL. |
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Supabase public key. |
 | `SUPABASE_SERVICE_ROLE_KEY` | Server-side Supabase access for storing uploads and findings. |

@@ -26,6 +26,7 @@ import { extractSheetByVision } from './stages/vision';
 import { determineApplicability } from './stages/applicability';
 import { verifyFinding, verifyFindings } from './stages/verify';
 import { RunLedger, BudgetExceededError } from './stages/runner';
+import { CreditExhaustedError } from './claude';
 import { evaluate, attachClauseQuotes, resetFindingIds } from './engine/evaluate';
 import { PART9_RULES } from './rules/part9';
 import { loadCodeStore, lookupClauses, quoteIsGrounded } from './code-store';
@@ -266,7 +267,7 @@ export async function prepareReview(input: {
       usage: ledger.usage,
     };
   } catch (err) {
-    if (err instanceof BudgetExceededError) throw err;
+    if (err instanceof BudgetExceededError || err instanceof CreditExhaustedError) throw err;
     return stopped(`applicability could not be determined: ${message(err)}`);
   }
 }
@@ -483,7 +484,8 @@ export async function runReview(opts: ReviewOptions): Promise<ReviewResult> {
           readings.push(r);
           progress('S2', `sheet ${sheet.number}: ${r.facts.length} value(s), ${r.facts.filter((f) => f.stable).length} read the same way twice`);
         } catch (err) {
-          if (err instanceof BudgetExceededError) throw err;
+          // Out of credit is not an unreadable sheet; stop rather than report one.
+          if (err instanceof BudgetExceededError || err instanceof CreditExhaustedError) throw err;
           readings.push({ sheet: sheet.number, facts: [], negative: [], usage: [], error: message(err) });
         }
       }
